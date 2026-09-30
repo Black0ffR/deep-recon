@@ -1,0 +1,29 @@
+# Recon output — never commit target data
+recon_*/
+*_recon_*/
+*.log
+
+# Monitor state and alerts (may contain target data)
+alerts/
+state/
+~/bounty/
+
+# Tool artifacts
+*.tmp
+*.bak
+.bak_*
+*~
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python (playbook generator, OMEGA hooks)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
