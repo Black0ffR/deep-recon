@@ -12,21 +12,40 @@
 # Options:
 #   -d  DOMAIN       Target domain (required)
 #   -o  OUTPUT_DIR   Output directory (default: ./recon_TARGET_DATE)
-#   -w  WORDLIST     Custom subdomain wordlist
+#   -w  WORDLIST     Extra content-discovery wordlist (merged in module 20)
 #   -t  THREADS      Threads for ffuf/httpx (default: 50)
-#   -s  SCOPE_FILE   File containing in-scope CIDR ranges (optional)
-#   -m  MODULES      Comma-separated modules to run (default: all)
-#                    Options: asn,rdns,ct,wayback,cloud,email,favicon,
-#                             ports,vhost,params,js,correlation
+#   -s  SCOPE_FILE   File containing in-scope CIDR ranges (optional but AUTHORITATIVE:
+#                    when supplied it overrides ASN-derived ranges everywhere)
+#   -m  MODULES      Comma-separated modules to run (default: all passive+probe)
+#   -c  CONFIG       Config file (KEY=VALUE, overrides defaults, env still wins)
 #   --skip-ports     Skip port scanning (faster, less noise)
-#   --passive-only   Run only zero-noise passive modules
-#   --resume         Resume previous run (reads existing output files)
+#   --passive-only   Zero-noise tier only (no login attempts, no evasion payloads)
+#   --resume         Resume a previous run: skip modules whose inputs are unchanged
+#   --authz-ref REF  Authorization reference. REQUIRED to run module 'auth'
+#                    (live credential attempts) -- it also unlocks the evasion
+#                    payload set in module 'intelligence'.
+#   --budget N       Abort outbound requests after N (default: unlimited)
+#   --no-cache       Do not read or write the HTTP fetch cache
+#   --refresh        Ignore cache TTL, refetch everything
+#   --dry-run        Plan only: resolve modules and scope, send no requests
 #   -v               Verbose output
 #
+# Modules: discover, asn, rdns, ct, wayback, cloud, email, favicon, ports, vhost,
+#          params, js, correlation, supplemental, protocol, intelligence, auth,
+#          cve, osint, content, metadata, deepproto, playbook, monitor
+#   discover  host enumeration; MUST run first, the rest depend on it
+#   auth      sends live login attempts -- gated behind --authz-ref
+#   intelligence  sends WAF-evasion payloads -- gated behind --authz-ref
+#
+# Environment: RUN_INTEGRATIONS, MONITOR_CRON, MONITOR_INTERVAL, LOOP,
+#              HUNTER_API_KEY, HIBP_API_KEY, VT_API_KEY, GITHUB_TOKEN,
+#              NVD_API_KEY, URLSCAN_API_KEY
+#
 # Dependencies (install via pkg/go install):
-#   Required:  curl, dig, whois, jq, python, git
+#   Required:  curl, dig, jq, python3, whois
+#   Optional:  whois, timeout, xxd|od, strings, comm, seq (absent => DEGRADED)
 #   Go tools:  subfinder, httpx, waybackurls, gau, dnsx, alterx, naabu
-#   Optional:  ffuf, nmap, masscan, arjun
+#   Optional:  ffuf, nmap, arjun, apktool, ldapsearch, wafw00f
 #
 # Author: Built for your Termux ARM64 recon workflow
 # =============================================================================
@@ -60,52 +79,265 @@ RESUME=false
 VERBOSE=false
 START_TIME=$(date +%s)
 
+# Run configuration (overridable by --config file and by environment)
+CONFIG_FILE=""
+DRY_RUN=false
+CACHE_TTL=21600            # 6h cache for HTTP fetches
+NO_CACHE=false
+REFRESH=false
+REQUEST_BUDGET=0           # 0 = unlimited; set with --budget
+RUN_INTEGRATIONS="${RUN_INTEGRATIONS:-false}"
+MONITOR_INTERVAL="${MONITOR_INTERVAL:-21600}"
+MONITOR_CRON="${MONITOR_CRON:-false}"
+LOOP="${LOOP:-false}"
+# API credentials. Every one of these used to be hardcoded as an empty/absent
+# key, which guaranteed a silent no-op: (Huntor.io, HIBP, VT and GitHub calls
+# could never succeed). They are now read from the environment or the config
+# file, and any call that needs one reports DEGRADED when it is absent.
+HUNTER_API_KEY="${HUNTER_API_KEY:-}"
+HIBP_API_KEY="${HIBP_API_KEY:-}"
+VT_API_KEY="${VT_API_KEY:-}"
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+NVD_API_KEY="${NVD_API_KEY:-}"
+URLSCAN_API_KEY="${URLSCAN_API_KEY:-}"
+# Authorization gate. Module 17 (auth) and Module 16 (intelligence) send live
+# credential attempts and WAF-evasion payloads. Those are gated on an explicit
+# opt-in *plus* a written reference, and are never in the passive tier.
+AUTHORIZED=false
+AUTHZ_REF=""
+ADDED_MODULES="none"
+REQUESTED_MODULES=""
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
+# LOG_FILE is bootstrapped before argument parsing so that an error during
+# parsing is still recorded and still reaches the terminal. Previously it was
+# "" until after `mkdir`, and `tee -a ""` exits without copying stdin to stdout
+# -- so `error "Domain required"` printed nothing at all and the script exited
+# 1 silently.
 LOG_FILE=""
 
-log()      { echo -e "${DIM}[$(date '+%H:%M:%S')]${NC} $*" | tee -a "$LOG_FILE"; }
-success()  { echo -e "${GREEN}[✔]${NC} $*" | tee -a "$LOG_FILE"; }
-warn()     { echo -e "${YELLOW}[!]${NC} $*" | tee -a "$LOG_FILE"; }
-error()    { echo -e "${RED}[✘]${NC} $*" | tee -a "$LOG_FILE"; }
-section()  { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════${NC}"; \
-             echo -e "${BOLD}${CYAN}  $*${NC}"; \
-             echo -e "${BOLD}${CYAN}══════════════════════════════════════${NC}\n" | tee -a "$LOG_FILE"; }
-info()     { echo -e "${BLUE}[i]${NC} $*" | tee -a "$LOG_FILE"; }
-finding()  { echo -e "${MAGENTA}[★ FINDING]${NC} $*" | tee -a "$LOG_FILE"; \
+_log_tee() {
+  # Append to the log when we have one, otherwise just emit to the terminal.
+  if [[ -n "$LOG_FILE" ]]; then tee -a "$LOG_FILE"; else cat; fi
+}
+
+log()      { echo -e "${DIM}[$(date '+%H:%M:%S')]${NC} $*" | _log_tee; }
+success()  { echo -e "${GREEN}[✔]${NC} $*" | _log_tee; }
+warn()     { echo -e "${YELLOW}[!]${NC} $*" | _log_tee; }
+error()    { echo -e "${RED}[✘]${NC} $*" | _log_tee; }
+section()  { echo -e "\n${BOLD}${CYAN}══════════════════════════════════════${NC}" | _log_tee; \
+             echo -e "${BOLD}${CYAN}  $*${NC}" | _log_tee; \
+             echo -e "${BOLD}${CYAN}══════════════════════════════════════${NC}\n" | _log_tee; }
+info()     { echo -e "${BLUE}[i]${NC} $*" | _log_tee; }
+finding()  { echo -e "${MAGENTA}[★ FINDING]${NC} $*" | _log_tee; \
              echo "$*" >> "${OUTPUT_DIR}/findings_summary.txt"; }
-verbose()  { [[ "$VERBOSE" == true ]] && echo -e "${DIM}[v]${NC} $*" | tee -a "$LOG_FILE" || true; }
+verbose()  { [[ "$VERBOSE" == true ]] && echo -e "${DIM}[v]${NC} $*" | _log_tee || true; }
+
+# ─── Run state: per-module status + tool accounting ───────────────────────────
+# Every module records how it ended. The old design had no way to distinguish
+# "ran and found nothing" from "silently did nothing", which is exactly the
+# failure mode that makes a degraded run look clean.
+MODULE_STATUS_DIR=""   # set in setup_output_dir
+TOOL_LOG=""            # JSONL: one record per external command
+REQUEST_COUNT=0
+TOOL_ERRORS=0
+CURRENT_MODULE=""
+
+module_start() {
+  CURRENT_MODULE="$1"
+  MODULE_T0=$(date +%s)
+  MODULE_ERRORS=0
+  MODULE_NOTE=""
+  verbose "── ${CURRENT_MODULE} start"
+}
+
+module_note() { MODULE_NOTE="${MODULE_NOTE:+$MODULE_NOTE; }$1"; }
+MODULE_CLOSED=true
+
+# run_module <fn> -- the only way a module is invoked. A module that returns
+# early (missing tool, no input, budget exhausted) still gets a status record,
+# because `return` unwinds only to run_module, not past module_done.
+run_module() {
+  local fn="$1"
+  MODULE_CLOSED=false
+  MODULE_NOTE=""
+  MODULE_ERRORS=0
+  module_start "${fn#module_}"
+  "$fn"
+  [[ "$MODULE_CLOSED" == true ]] || module_done
+}
+
+# module_done [state] [reason]
+#   no args  -> RAN, or DEGRADED if the module recorded a note (missing tool,
+#               no host inventory, exhausted budget, ...)
+#   explicit -> used for SKIPPED
+# Anything not RAN must say why; the report renders this as a coverage table.
+module_done() {
+  local state="${1:-}"
+  local reason="${2:-}"
+  if [[ -z "$state" ]]; then
+    if [[ -n "$MODULE_NOTE" ]]; then state="DEGRADED"; else state="RAN"; fi
+    reason="$MODULE_NOTE"
+  fi
+  MODULE_CLOSED=true
+  local dt=$(( $(date +%s) - MODULE_T0 ))
+  local note="${reason:-$MODULE_NOTE}"
+  mkdir -p "$MODULE_STATUS_DIR"
+  {
+    printf '{\n'
+    printf '  "module": "%s",\n'  "$CURRENT_MODULE"
+    printf '  "state": "%s",\n'   "$state"
+    printf '  "reason": "%s",\n'  "$(printf '%s' "$note" | tr -d '"\\')"
+    printf '  "seconds": %s,\n'   "$dt"
+    printf '  "tool_errors": %s\n' "$MODULE_ERRORS"
+    printf '}\n'
+  } > "${MODULE_STATUS_DIR}/${CURRENT_MODULE}.json"
+  case "$state" in
+    RAN)      success "${CURRENT_MODULE} complete (${dt}s)" ;;
+    DEGRADED) warn    "${CURRENT_MODULE} DEGRADED (${dt}s) — ${note}" ;;
+    SKIPPED)  info    "${CURRENT_MODULE} SKIPPED — ${note}" ;;
+  esac
+  CURRENT_MODULE=""
+}
+
+# run_tool <label> <cmd...> -- central choke point for external commands.
+# Records exit status, duration and output size so that the report can state
+# how much of the run actually worked. A tool that fails is counted, not hidden.
+run_tool() {
+  local label="$1"; shift
+  local t0 t1 rc out
+  t0=$(date +%s%3N 2>/dev/null || date +%s)
+  out=$("$@" 2>/dev/null); rc=$?
+  t1=$(date +%s%3N 2>/dev/null || date +%s)
+  [[ $rc -ne 0 ]] && { MODULE_ERRORS=$((MODULE_ERRORS+1)); TOOL_ERRORS=$((TOOL_ERRORS+1)); }
+  [[ -n "$TOOL_LOG" ]] && printf '{"t":"%s","label":"%s","rc":%s,"ms":%s,"bytes":%s}\n' \
+      "$(date '+%H:%M:%S')" "$label" "$rc" "$((t1-t0))" "${#out}" >> "$TOOL_LOG"
+  printf '%s' "$out"
+  return $rc
+}
+
+# Budget accounting -- a hard ceiling on outbound requests per run.
+budget_take() {
+  REQUEST_COUNT=$((REQUEST_COUNT+1))
+  if [[ $REQUEST_BUDGET -gt 0 && $REQUEST_COUNT -gt $REQUEST_BUDGET ]]; then
+    budget_exhausted=true
+    return 1
+  fi
+  return 0
+}
+budget_exhausted=false
 
 # ─── Arg parsing ──────────────────────────────────────────────────────────────
 usage() {
-  grep '^#' "$0" | grep -v '#!/' | sed 's/^# \?//' | head -40
+  grep '^#' "$0" | grep -v '#!/' | sed 's/^# \?//' | head -60
   exit 0
+}
+
+need_val() {
+  # Without this, `./deep_recon.sh -d` dereferences $2 under `set -u` and dies
+  # with "unbound variable" instead of telling the user what is missing.
+  if [[ -z "${2:-}" ]]; then
+    error "Option $1 requires a value"
+    exit 1
+  fi
+}
+
+load_config() {
+  [[ -z "$CONFIG_FILE" ]] && return 0
+  [[ -f "$CONFIG_FILE" ]] || { error "Config file not found: $CONFIG_FILE"; exit 1; }
+  local line key val
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    [[ "$line" != *=* ]] && continue
+    key="${line%%=*}"; val="${line#*=}"
+    key="${key// /}"; val="${val# }"; val="${val% }"
+    val="${val%\"}"; val="${val#\"}"
+    case "$key" in
+      DOMAIN|OUTPUT_DIR|SCOPE_FILE|THREADS|MODULES|REQUEST_BUDGET|CACHE_TTL) printf -v "$key" '%s' "$val" ;;
+      SKIP_PORTS|RESUME|VERBOSE|DRY_RUN|NO_CACHE|REFRESH) [[ "$val" == "true" ]] && printf -v "$key" '%s' true || printf -v "$key" '%s' false ;;
+      HUNTER_API_KEY|HIBP_API_KEY|VT_API_KEY|GITHUB_TOKEN|NVD_API_KEY|URLSCAN_API_KEY|AUTHZ_REF) printf -v "$key" '%s' "$val" ;;
+      *) warn "Unknown config key: $key" ;;
+    esac
+  done < "$CONFIG_FILE"
+  info "Config loaded: ${CONFIG_FILE}"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -d) DOMAIN="$2"; shift 2 ;;
-    -o) OUTPUT_DIR="$2"; shift 2 ;;
-    -w) WORDLIST="$2"; shift 2 ;;
-    -t) THREADS="$2"; shift 2 ;;
-    -s) SCOPE_FILE="$2"; shift 2 ;;
-    -m) MODULES="$2"; shift 2 ;;
+    -d) need_val "$1" "${2:-}"; DOMAIN="$2"; shift 2 ;;
+    -o) need_val "$1" "${2:-}"; OUTPUT_DIR="$2"; shift 2 ;;
+    -w) need_val "$1" "${2:-}"; WORDLIST="$2"; shift 2 ;;
+    -t) need_val "$1" "${2:-}"; THREADS="$2"; shift 2 ;;
+    -s) need_val "$1" "${2:-}"; SCOPE_FILE="$2"; shift 2 ;;
+    -m) need_val "$1" "${2:-}"; MODULES="$2"; shift 2 ;;
+    -c) need_val "$1" "${2:-}"; CONFIG_FILE="$2"; shift 2 ;;
     --skip-ports) SKIP_PORTS=true; shift ;;
-    --passive-only) PASSIVE_ONLY=true; MODULES="asn,rdns,ct,wayback,cloud,email,favicon,js,supplemental,intelligence,auth,cve,osint,metadata,playbook"; shift ;;
+    # Tier fix: the old "passive-only" list included `auth` (12 live credential
+    # POSTs per login URL) and `intelligence` (WAF-evasion payloads). Those are
+    # not passive, and they are now in the gated tier instead.
+    --passive-only) PASSIVE_ONLY=true; MODULES="discover,asn,rdns,ct,wayback,cloud,email,favicon,js,supplemental,cve,osint,metadata"; shift ;;
     --resume) RESUME=true; shift ;;
+    --authz-ref) need_val "$1" "${2:-}"; AUTHZ_REF="$2"; AUTHORIZED=true; shift 2 ;;
+    --budget) need_val "$1" "${2:-}"; REQUEST_BUDGET="$2"; shift 2 ;;
+    --no-cache) NO_CACHE=true; shift ;;
+    --refresh) REFRESH=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
     -v) VERBOSE=true; shift ;;
     -h|--help) usage ;;
-    *) error "Unknown option: $1"; exit 1 ;;
+    *) error "Unknown option: $1"; error "Try: $0 --help"; exit 1 ;;
   esac
 done
 
-[[ -z "$DOMAIN" ]] && { error "Domain required. Use: $0 -d target.com"; exit 1; }
+load_config
+
+[[ -n "$AUTHZ_REF" ]] && AUTHORIZED=true
+
+if [[ -z "$DOMAIN" ]]; then
+  error "Domain required. Use: $0 -d target.com"
+  exit 1
+fi
+
+# A gated module without an authorization reference is a configuration error,
+# not something to discover halfway through a run.
+if [[ ",$MODULES," == *",auth,"* || ",$MODULES," == *",intelligence,"* ]]; then
+  if [[ "$AUTHORIZED" != true ]]; then
+    error "Module 'auth' performs live credential attempts and 'intelligence'"
+    error "performs WAF-evasion payloads. Both require explicit authorization:"
+    error ""
+    error "    $0 -d ${DOMAIN} --authz-ref 'PROGRAM-TICKET-123'"
+    error ""
+    error "Use --passive-only to exclude both."
+    exit 1
+  fi
+  info "Authorization reference recorded: ${AUTHZ_REF}"
+fi
 
 # ─── Setup output directory ───────────────────────────────────────────────────
 DATE=$(date '+%Y%m%d_%H%M')
 [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="./recon_${DOMAIN}_${DATE}"
-mkdir -p "$OUTPUT_DIR"/{asn,dns,ct,wayback,cloud,email,ports,vhost,content,js,params,correlation,reports}
-LOG_FILE="${OUTPUT_DIR}/deep_recon.log"
-touch "${OUTPUT_DIR}/findings_summary.txt"
+# A dry run must not leave an output tree behind: it is a planning command, and
+# creating ./recon_<target>_<date>/ for a plan that sends nothing is a side
+# effect the operator did not ask for.
+if [[ "$DRY_RUN" == true ]]; then
+  LOG_FILE=""
+  mkdir -p "${OUTPUT_DIR}" 2>/dev/null || true
+else
+  mkdir -p "$OUTPUT_DIR"/{asn,dns,ct,wayback,cloud,email,ports,vhost,content,js,params,correlation,reports,discover,supplemental,protocol,intelligence,auth,cve,osint,metadata,deepproto,playbook}
+  LOG_FILE="${OUTPUT_DIR}/deep_recon.log"
+  touch "${OUTPUT_DIR}/findings_summary.txt"
+fi
+
+# Run state lives beside the findings so a report can always explain itself.
+MODULE_STATUS_DIR="${OUTPUT_DIR}/state/modules"
+STATE_DIR="${OUTPUT_DIR}/state"
+CACHE_DIR="${STATE_DIR}/cache"
+RESUME_DIR="${STATE_DIR}/done"
+mkdir -p "$MODULE_STATUS_DIR" "$CACHE_DIR" "$RESUME_DIR"
+TOOL_LOG="${STATE_DIR}/tool_calls.jsonl"
+: > "$TOOL_LOG"
+# Host inventory. Kept under js/ so every existing consumer path is unchanged,
+# but ownership now belongs to the `discover` module, not to module_js.
+HOSTS_FILE="${OUTPUT_DIR}/js/live_hosts.txt"
 
 # ─── Banner ───────────────────────────────────────────────────────────────────
 banner() {
@@ -123,6 +355,20 @@ EOF
   echo -e "  ${BOLD}Output:${NC}  ${OUTPUT_DIR}"
   echo -e "  ${BOLD}Modules:${NC} ${MODULES}"
   echo -e "  ${BOLD}Mode:${NC}    $([ "$PASSIVE_ONLY" == true ] && echo 'Passive Only' || echo 'Full')"
+  if [[ "$AUTHORIZED" == true ]]; then
+    echo -e "  ${BOLD}Authz:${NC}    ${YELLOW}ACTIVE${NC} (${AUTHZ_REF}) — credential + evasion probes enabled"
+  else
+    echo -e "  ${BOLD}Authz:${NC}    ${DIM}not declared — auth/intelligence modules will refuse to run${NC}"
+  fi
+  if [[ -n "$SCOPE_CIDRS_FILE" ]]; then
+    echo -e "  ${BOLD}Scope:${NC}    ${YELLOW}AUTHORITATIVE${NC} (${SCOPE_CIDRS_FILE})"
+  fi
+  if [[ $REQUEST_BUDGET -gt 0 ]]; then
+    echo -e "  ${BOLD}Budget:${NC}   ${REQUEST_BUDGET} outbound requests"
+  fi
+  if [[ "$DRY_RUN" == true ]]; then
+    echo -e "  ${BOLD}DRY RUN:${NC}  no requests will be sent"
+  fi
   echo ""
 }
 
@@ -131,7 +377,7 @@ has_tool() { command -v "$1" &>/dev/null; }
 
 require_tool() {
   if ! has_tool "$1"; then
-    warn "Optional tool '$1' not found — skipping related checks."
+    warn "Required tool '$1' not found — related checks will be skipped."
     return 1
   fi
   return 0
@@ -139,6 +385,7 @@ require_tool() {
 
 check_core_deps() {
   local missing=()
+  # Hard requirements: without these the script cannot produce anything.
   for t in curl dig jq python3; do
     has_tool "$t" || missing+=("$t")
   done
@@ -147,34 +394,271 @@ check_core_deps() {
     error "Install with: pkg install ${missing[*]}"
     exit 1
   fi
+  # Soft requirements. The old script declared none of these, so a missing xxd
+  # made the LDAP and MQTT probes return empty and report "no anonymous bind" /
+  # "no open broker" as if the target had been checked and come back clean.
+  # These degrade a module rather than stopping the run, so warn loudly and
+  # record the degradation instead of exiting.
+  local soft=()
+  for t in whois timeout xxd strings comm seq od; do
+    has_tool "$t" || soft+=("$t")
+  done
+  if [[ ${#soft[@]} -gt 0 ]]; then
+    warn "Missing optional tools: ${soft[*]}"
+    warn "  Modules using them will be DEGRADED and say so in the report."
+    warn "  Install with: pkg install coreutils termux-tools"
+    DEGRADED_TOOLS="${soft[*]}"
+  fi
+}
+
+# Hex dump that works with or without xxd. xxd prints "0a 01 00"; od -An -tx1
+# prints the same, so the greps that look for a byte sequence behave identically.
+hexdump() {
+  if has_tool xxd; then xxd; else od -An -tx1; fi
 }
 
 module_enabled() {
   [[ ",$MODULES," == *",$1,"* ]]
 }
 
+# ─── Module dependency graph ──────────────────────────────────────────────────
+# Modules exchange data only through files, so the order of the `module_enabled
+# … && module_*` lines in main() *was* the contract. Selecting a module alone
+# silently gave it empty inputs. Each module now declares what it needs; the
+# dispatcher adds the closure and records what it added.
+declare -A MODULE_DEPS=(
+  [rdns]="asn"          [ct]=""            [wayback]=""
+  [cloud]=""            [email]=""         [favicon]=""
+  [ports]="asn ct"      [vhost]="asn"      [params]="wayback"
+  [js]="ct"             [correlation]="ct wayback"   [supplemental]="js"
+  [protocol]="js"       [intelligence]="js correlation"  [auth]="js"
+  [cve]="js supplemental"  [osint]="correlation"  [content]="js"
+  [metadata]="js wayback"  [deepproto]="js ports"  [playbook]="js cve"
+)
+
+resolve_modules() {
+  local -a queue=() resolved=() changed=1
+  IFS=',' read -ra queue <<< "$MODULES"
+  local m
+  while [[ $changed -eq 1 ]]; do
+    changed=0
+    for m in "${queue[@]}"; do
+      [[ -z "$m" ]] && continue
+      [[ " ${resolved[*]} " == *" $m "* ]] && continue
+      resolved+=("$m")
+      changed=1
+      local dep
+      for dep in ${MODULE_DEPS[$m]:-}; do
+        [[ " ${resolved[*]} " == *" $dep "* ]] || queue+=("$dep")
+      done
+    done
+  done
+  local -a added=()
+  local orig
+  IFS=',' read -ra orig <<< "$MODULES"
+  for m in "${resolved[@]}"; do
+    [[ " ${orig[*]} " == *" $m "* ]] || added+=("$m")
+  done
+  MODULES=$(IFS=,; echo "${resolved[*]}")
+  # Global, so the run manifest can record what the dependency graph added.
+  if [[ ${#added[@]} -gt 0 ]]; then
+    ADDED_MODULES=$(IFS=,; echo "${added[*]}")
+    info "Dependency resolution added: ${ADDED_MODULES}"
+  else
+    ADDED_MODULES="none"
+  fi
+}
+
+# ─── Resume: skip a module whose inputs are unchanged ─────────────────────────
+resume_key() {
+  # A module is "done" when the script version, the target, the module and the
+  # digests of its declared inputs all match the previous run.
+  local m="$1"; shift
+  local key="v3|${DOMAIN}|${m}|${MODULES}"
+  local f
+  for f in "$@"; do
+    [[ -f "$f" ]] && key="${key}|$(cksum "$f" 2>/dev/null | cut -d' ' -f1)"
+  done
+  printf '%s' "$key"
+}
+
+resume_satisfied() {
+  local key_file="${RESUME_DIR}/$1.key"
+  [[ "$RESUME" == true && -f "$key_file" ]] || return 1
+  [[ "$(cat "$key_file")" == "$2" ]] || return 1
+  return 0
+}
+resume_mark() { printf '%s' "$2" > "${RESUME_DIR}/$1.key"; }
+
 # ─── Utility functions ────────────────────────────────────────────────────────
 count_lines() { [[ -f "$1" ]] && wc -l < "$1" || echo 0; }
 
-dedupe_file() {
-  [[ -f "$1" ]] && sort -u "$1" -o "$1"
+dedupe_file() { [[ -f "$1" ]] && sort -u "$1" -o "$1"; return 0; }
+
+# base_name: the registrable label, derived once.
+# The old code used `cut -d. -f1` in one module and `rev | cut -d. -f2 | rev` in
+# six others, so for "target.co.uk" it produced both "target" and "co" -- and
+# "co-backup", "cocom", "co-default-rtdb.firebaseio.com" and GitHub org "coinc"
+# were all generated from the wrong one.
+base_name() {
+  local d="$1" first rest
+  first="${d%%.*}"; rest="${d#*.}"
+  case "$rest" in
+    co.uk|com.au|co.jp|co.nz|com.br|com.cn|co.za|com.mx|co.in)
+      printf '%s' "${rest%%.*}" ;;
+    *)
+      printf '%s' "$first" ;;
+  esac
 }
 
+# dom_regex: a domain escaped for use as a *literal* inside a grep -E pattern.
+# The old code alternated between "\.${DOMAIN}\$" and "${DOMAIN}\$" in adjacent
+# positions, so the same domain was both a literal and a wildcard pattern
+# depending on which half of the line you looked at.
+dom_regex() { printf '%s' "$1" | sed 's/[.[\*^$+?(){}|\\]/\\&/g'; }
+domain_re()  { printf '\\.%s\\$' "$(dom_regex "$DOMAIN")"; }
+domain_anchor_re() { printf '%s\\$' "$(dom_regex "$DOMAIN")"; }
+
+# ─── Scope / authorization enforcement ────────────────────────────────────────
+# A user-supplied -s SCOPE_FILE is an authorization boundary. Previously it was
+# copied into the output tree and then ignored: module_rdns preferred
+# asn/ipv4_cidrs.txt whenever it existed, so the sweep ran over the whole
+# announced prefix set of the ASN.
+SCOPE_CIDRS_FILE=""   # set in apply_scope
+in_scope_ip() {
+  local ip="$1"
+  [[ -z "$SCOPE_CIDRS_FILE" || ! -f "$SCOPE_CIDRS_FILE" ]] && return 0
+  [[ -f "${OUTPUT_DIR}/asn/scope_cidrs.txt" ]] || return 0
+  grep -qE "(^| )$(dom_regex "$ip")( |$)" "${OUTPUT_DIR}/asn/scope_cidrs.txt" 2>/dev/null
+}
+
+apply_scope() {
+  if [[ -n "$SCOPE_FILE" && -f "$SCOPE_FILE" ]]; then
+    cp "$SCOPE_FILE" "${OUTPUT_DIR}/asn/scope_cidrs.txt"
+    SCOPE_CIDRS_FILE="${OUTPUT_DIR}/asn/scope_cidrs.txt"
+    info "Scope file is AUTHORITATIVE: $(count_lines "$SCOPE_CIDRS_FILE") CIDR entries"
+  elif [[ -n "$SCOPE_FILE" ]]; then
+    warn "Scope file not found: $SCOPE_FILE -- continuing without scope limits"
+  fi
+}
+
+# ─── Host-discovery contract ──────────────────────────────────────────────────
+# js/live_hosts.txt used to be written by module_js and then, when it was
+# missing, *re-created with a single line* by six other modules. A run that
+# covered one host instead of fifty was therefore indistinguishable from a
+# target that has one host. Host discovery is now its own module, it always
+# runs, and consumers fail loudly instead of fabricating an input.
+require_live_hosts() {
+  # Prefer the discovery module's output; fall back to a single apex host but
+  # SAY SO in the module status, so the report shows the reduced coverage.
+  if [[ -s "$HOSTS_FILE" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$HOSTS_FILE")"
+  echo "https://${DOMAIN}" > "$HOSTS_FILE"
+  module_note "NO_HOST_INVENTORY (tested apex only -- run module 'discover')"
+  return 0
+}
+
+# Every module that issues requests should honour the budget.
+budget_guard() {
+  if [[ "$budget_exhausted" == true ]]; then
+    module_note "BUDGET_EXHAUSTED (${REQUEST_BUDGET} requests)"
+    return 1
+  fi
+  return 0
+}
+
+# ─── HTTP fetch: cache + rate limit + accounting ──────────────────────────────
+# One choke point for third-party HTTP so that (a) the same URL is fetched once
+# per run instead of four times, (b) politeness is a single shared budget rather
+# than a per-site sleep that scales with module count, and (c) every request is
+# counted and logged.
+_fetch_cache_key() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
+
 rate_limited_curl() {
-  # Polite curl with retry and backoff
+  # Polite curl with on-disk cache, retry/backoff and accounting.
+  #
+  # Timing: the old code was `curl --max-time 15 --retry 2` inside a 3-iteration
+  # loop. --max-time is per transfer and --retry re-runs the transfer, so a
+  # single "polite" fetch could block for 3 x (15s + backoff) x 3 ~ 2 minutes
+  # with no output, which reads as a hang. Budget is now explicit: a hard
+  # per-attempt connect timeout, one internal retry, two outer attempts, and an
+  # overall deadline for the whole call.
   local url="$1"; shift
-  local max_retries=3
-  local delay=2
-  for i in $(seq 1 $max_retries); do
-    if curl -sL --max-time 15 --retry 2 "$@" "$url" 2>/dev/null; then
+  local max_retries=2 delay=1 i rc body
+  local per_attempt="${FETCH_TIMEOUT:-15}" connect_to=8 call_deadline=$(( $(date +%s) + ${FETCH_DEADLINE:-45} ))
+
+  if [[ "$DRY_RUN" == true ]]; then
+    budget_take || return 1
+    verbose "DRY-RUN fetch: $url"
+    return 0
+  fi
+  if ! budget_take; then
+    warn "Request budget (${REQUEST_BUDGET}) exhausted -- skipping $url"
+    return 1
+  fi
+
+  if [[ "$NO_CACHE" != true && "$REFRESH" != true ]]; then
+    local ckey="${CACHE_DIR}/$(_fetch_cache_key "$url").body"
+    local cmeta="${ckey%.body}.meta"
+    if [[ -f "$ckey" ]]; then
+      local age=$(( $(date +%s) - $(stat -c %Y "$ckey" 2>/dev/null || echo 0) ))
+      if [[ $age -lt $CACHE_TTL ]]; then
+        verbose "cache hit ($((CACHE_TTL-age))s left): $url"
+        cat "$ckey"
+        return 0
+      fi
+      rm -f "$ckey" "$cmeta"
+    fi
+  fi
+
+  for ((i=1; i<=max_retries; i++)); do
+    [[ $(date +%s) -ge $call_deadline ]] && { verbose "fetch deadline hit: $url"; break; }
+    time_left || { verbose "run deadline hit: $url"; break; }
+    body=$(curl -sL --connect-timeout $connect_to --max-time $per_attempt \
+      --retry 1 "$@" "$url" 2>/dev/null); rc=$?
+    # curl exits 0 on HTTP 4xx/5xx; only transport failures are retried.
+    if [[ $rc -eq 0 ]]; then
+      if [[ "$NO_CACHE" != true ]]; then
+        local ckey="${CACHE_DIR}/$(_fetch_cache_key "$url").body"
+        printf '%s' "$body" > "$ckey"
+        printf 'url=%s\nat=%s\n' "$url" "$(date +%s)" > "${ckey%.body}.meta"
+      fi
+      printf '%s' "$body"
       return 0
     fi
-    verbose "Retry $i/$max_retries for $url"
+    verbose "Retry $i/$max_retries for $url (curl rc=$rc)"
     sleep $((delay * i))
   done
   verbose "Failed after $max_retries attempts: $url"
+  [[ $MODULE_ERRORS -gt 0 ]] && MODULE_ERRORS=$((MODULE_ERRORS-1))
+  TOOL_ERRORS=$((TOOL_ERRORS+1))
+  printf '{"t":"%s","label":"curl","rc":1,"url":"%s"}\n' \
+    "$(date '+%H:%M:%S')" "$url" >> "$TOOL_LOG"
   return 1
 }
+
+# http_code: one wrapper for "give me just the status code". The old call sites
+# did `curl -w '%{http_code}' … || echo "000"`, which appends a SECOND 000
+# because curl already printed one before exiting non-zero -- producing "000\n000"
+# at 35 sites. Passing -o/-D through lets the same helper serve bodyless probes
+# and header dumps alike.
+http_code() {
+  local out rc
+  out=$(curl -sk -o /dev/null -w '%{http_code}' "$@" 2>/dev/null); rc=$?
+  printf '%s' "${out:-000}"
+  return $rc
+}
+
+# ─── Polling helper ───────────────────────────────────────────────────────────
+# Set by the operator to bound the total runtime of a module. Callers check
+# `time_left` before each unit of work so a long module degrades instead of
+# overrunning.
+RUN_DEADLINE=0
+[[ -n "${MAX_RUNTIME:-}" ]] && RUN_DEADLINE=$(( $(date +%s) + MAX_RUNTIME ))
+DEGRADED_TOOLS=""
+time_left() { [[ $RUN_DEADLINE -eq 0 ]] && return 0; [[ $(date +%s) -lt $RUN_DEADLINE ]]; }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE 1: ASN & IP SPACE ENUMERATION
@@ -187,7 +671,10 @@ module_asn() {
   # 1a. Resolve the domain to IPs
   info "Resolving domain to IPs..."
   dig +short "$DOMAIN" A 2>/dev/null | grep -E '^[0-9]+\.' > "${asn_dir}/domain_ips.txt" || true
-  dig +short "$DOMAIN" AAAA 2>/dev/null >> "${asn_dir}/domain_ips.txt" || true
+  # AAAA answers can be CNAME targets or other non-address junk; only keep real
+  # IPv6 literals so that everything downstream (port scans, /dev/tcp probes)
+  # never receives a non-address as a scan target.
+  dig +short "$DOMAIN" AAAA 2>/dev/null | grep -E '^[0-9a-fA-F:]+:[0-9a-fA-F:]*$' >> "${asn_dir}/domain_ips.txt" || true
   dedupe_file "${asn_dir}/domain_ips.txt"
 
   if [[ ! -s "${asn_dir}/domain_ips.txt" ]]; then
@@ -203,7 +690,8 @@ module_asn() {
   # If the resolved IP belongs to a CDN (Cloudflare/Akamai/Fastly/etc),
   # looking up ASN by IP returns the CDN's ASN, not the target's.
   # Detect this and switch to org-name based lookup instead.
-  local CDN_ASNS="AS13335 AS20940 AS16625 AS54113 AS209242 AS394536 AS200814"  # CF, Akamai, Fastly
+  # CDN ASNs are compared by number further down (see `cdn_asns`); this
+  # `AS`-prefixed list was never read.
   local CDN_RANGES="104.16. 104.17. 104.18. 104.19. 104.20. 104.21. 172.64. 172.65. 172.66. 162.158. 198.41."
   local is_cdn=false
 
@@ -268,7 +756,7 @@ module_asn() {
   # ── CDN bypass 2: BGPView org name search ─────────────────────────────────
   if [[ -z "$asn_number" ]]; then
     local company_name
-    company_name=$(echo "$DOMAIN" | rev | cut -d. -f2 | rev)
+    company_name=$(base_name "$DOMAIN")
     info "Searching BGPView by org name: '${company_name}'..."
     local search_data
     search_data=$(rate_limited_curl "https://api.bgpview.io/search?query=${company_name}") || true
@@ -327,7 +815,7 @@ module_asn() {
   # ── CDN bypass 5: ARIN RDAP org name search ───────────────────────────────
   if [[ -z "$asn_number" ]] || [[ "$is_cdn_asn" == true ]]; then
     local company_name2
-    company_name2=$(echo "$DOMAIN" | rev | cut -d. -f2 | rev)
+    company_name2=$(base_name "$DOMAIN")
     info "Trying ARIN RDAP org search: '${company_name2}'..."
     local arin_data
     arin_data=$(rate_limited_curl \
@@ -394,13 +882,17 @@ module_asn() {
     fi
   fi
 
-  # If scope file provided, use those CIDRs directly (always honoured)
-  if [[ -n "$SCOPE_FILE" && -f "$SCOPE_FILE" ]]; then
-    cp "$SCOPE_FILE" "${asn_dir}/scope_cidrs.txt"
-    finding "Loaded $(count_lines "${asn_dir}/scope_cidrs.txt") CIDRs from scope file"
+  # An operator-supplied scope file is an authorization boundary. apply_scope()
+  # already copied it and set SCOPE_CIDRS_FILE in main(); report it here and mark
+  # the ASN-derived ranges as informational only, so the two are never confused.
+  if [[ -n "$SCOPE_CIDRS_FILE" && -s "$SCOPE_CIDRS_FILE" ]]; then
+    finding "Scope: $(count_lines "$SCOPE_CIDRS_FILE") CIDRs loaded from operator scope file (AUTHORITATIVE)"
+    module_note "operator scope file in effect — ASN ranges are informational"
+  fi
+  if [[ -s "${asn_dir}/ipv4_cidrs.txt" ]]; then
+    verbose "ASN-derived ranges: $(count_lines "${asn_dir}/ipv4_cidrs.txt") (informational only if a scope file was given)"
   fi
 
-  success "ASN module complete — CIDRs saved to ${asn_dir}/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -410,21 +902,40 @@ module_asn() {
 module_rdns() {
   section "MODULE 2: Reverse DNS Sweep"
   local rdns_dir="${OUTPUT_DIR}/dns"
-  local cidr_file="${OUTPUT_DIR}/asn/ipv4_cidrs.txt"
+  local scope_cidrs="${OUTPUT_DIR}/asn/scope_cidrs.txt"
+  local asn_cidrs="${OUTPUT_DIR}/asn/ipv4_cidrs.txt"
 
-  [[ ! -s "$cidr_file" ]] && cidr_file="${OUTPUT_DIR}/asn/scope_cidrs.txt"
-  if [[ ! -s "$cidr_file" ]]; then
-    warn "No CIDRs found — skipping reverse DNS. Run ASN module first."
+  # Scope precedence fix: a user-supplied -s SCOPE_FILE is an authorization
+  # boundary and must WIN over ASN-derived ranges. The old code preferred
+  # ipv4_cidrs.txt whenever it was non-empty, so passing a scope file silently
+  # did nothing whenever the ASN module had also run -- and the PTR sweep went
+  # out over the whole announced prefix set of the ASN.
+  local cidr_file=""
+  if [[ -n "$SCOPE_CIDRS_FILE" && -s "$SCOPE_CIDRS_FILE" ]]; then
+    cidr_file="$scope_cidrs"
+    info "Using operator-supplied scope (authoritative) — not ASN-derived ranges"
+  elif [[ -s "$asn_cidrs" ]]; then
+    cidr_file="$asn_cidrs"
+    warn "No scope file supplied — sweeping ASN-derived ranges from ${asn_cidrs}"
+    warn "  If the program limits you to specific ranges, re-run with -s scope.txt"
+  fi
+
+  if [[ -z "$cidr_file" ]]; then
+    warn "No CIDRs found — skipping reverse DNS. Run ASN module first or pass -s."
+    module_done SKIPPED "no CIDRs (run asn, or supply -s scope.txt)"
     return
   fi
 
   # Try dnsx first (fastest), fall back to host command
   if require_tool dnsx; then
-    info "Running reverse DNS via dnsx..."
-    # Generate IP list from CIDRs
+    info "Running reverse DNS via dnsx over $(count_lines "$cidr_file") prefixes..."
     # dnsx supports CIDR input directly with -ptr flag
-    dnsx -ptr -l "$cidr_file" -silent -o "${rdns_dir}/rdns_results.txt" \
-      -t "$THREADS" 2>/dev/null || true
+    : > "${rdns_dir}/rdns_results.txt"
+    run_tool dnsx dnsx -ptr -l "$cidr_file" -silent \
+      -o "${rdns_dir}/rdns_results.txt" -t "$THREADS" >/dev/null 2>&1 || true
+    if [[ ! -s "${rdns_dir}/rdns_results.txt" ]]; then
+      MODULE_ERRORS=$((MODULE_ERRORS+1))
+    fi
   else
     info "dnsx not found — using dig PTR (slower)..."
     # Fallback: only scan /24 of primary IP
@@ -446,8 +957,11 @@ module_rdns() {
     rdns_count=$(count_lines "${rdns_dir}/rdns_results.txt")
     finding "Reverse DNS: ${rdns_count} PTR records discovered"
 
-    # Extract hostnames and add to subdomain pool
-    grep -oP '[a-zA-Z0-9._-]+\.'$(echo "$DOMAIN" | sed 's/\./\\./g') \
+    # Extract hostnames and add to subdomain pool. The PTR value is captured
+    # relative to the literal target domain, which is why the domain is escaped
+    # rather than interpolated raw.
+    local d_re; d_re=$(dom_regex "$DOMAIN")
+    grep -oP '[a-zA-Z0-9._-]+\.'"${d_re}" \
       "${rdns_dir}/rdns_results.txt" 2>/dev/null \
       >> "${rdns_dir}/rdns_subdomains.txt" || true
     dedupe_file "${rdns_dir}/rdns_subdomains.txt"
@@ -463,7 +977,7 @@ module_rdns() {
       finding "Reverse DNS: ${interesting_count} INTERESTING hostnames (dev/staging/admin/etc)"
   fi
 
-  success "Reverse DNS module complete"
+  module_done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -506,7 +1020,7 @@ module_ct() {
     rate_limited_curl "https://tls.bufferover.run/dns?q=.${DOMAIN}" \
       | jq -r '.Results[]' 2>/dev/null \
       | cut -d',' -f5 \
-      | grep -i "\.${DOMAIN}\$" \
+      | grep -i "\.$(domain_re)" \
       | sort -u > "${ct_dir}/ct_subdomains_raw.txt" || true
   fi
 
@@ -581,8 +1095,8 @@ module_ct() {
       "${ct_dir}/ct_all_domains.txt" 2>/dev/null | sort | uniq -c | sort -rn
 
     echo -e "\n# Domains NOT matching *.${DOMAIN} (possible acquisitions):"
-    grep -v "\.${DOMAIN}\$" "${ct_dir}/ct_all_domains.txt" 2>/dev/null \
-      | grep -v "^${DOMAIN}\$" | sort -u
+    grep -v "\.$(domain_re)" "${ct_dir}/ct_all_domains.txt" 2>/dev/null \
+      | grep -v "^$(domain_anchor_re)" | sort -u
   } > "${ct_dir}/ct_analysis.txt"
 
   # Flag interesting service names
@@ -597,7 +1111,6 @@ module_ct() {
   [[ $interesting_services -gt 0 ]] && \
     finding "CT: ${interesting_services} high-value service subdomains (jenkins/grafana/kibana etc)"
 
-  success "CT module complete — ${total_ct} domains, analysis at ${ct_dir}/ct_analysis.txt"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -716,7 +1229,6 @@ module_wayback() {
     | grep -i "${DOMAIN}\$" \
     | sort -u > "${wb_dir}/wayback_subdomains.txt" || true
 
-  success "Wayback module complete — check ${wb_dir}/ for extracted intelligence"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -729,7 +1241,7 @@ module_cloud() {
 
   # Extract company name variations from domain
   local base_name
-  base_name=$(echo "$DOMAIN" | cut -d. -f1)
+  base_name=$(base_name "$DOMAIN")
 
   # Build bucket name permutation list
   info "Generating bucket name permutations for: $base_name"
@@ -781,7 +1293,11 @@ EOF
   dedupe_file "${cloud_dir}/bucket_names.txt"
 
   local checked=0
-  local found_buckets=()
+  # Publicly-readable buckets are the highest-severity result in this module, so
+  # they get their own artifact: the old code collected them into an array that
+  # was never read, while s3_exists.txt (which the priority engine scores) was
+  # written only for the 403/301/302 cases.
+  : > "${cloud_dir}/s3_public.txt"
 
   # 5a. AWS S3 bucket enumeration
   info "Checking AWS S3 buckets..."
@@ -792,12 +1308,12 @@ EOF
     local s3_url="https://${bucket}.s3.amazonaws.com"
     local http_code
     http_code=$(curl -sk -o /dev/null -w "%{http_code}" \
-      --max-time 5 "$s3_url" 2>/dev/null || echo "000")
+      --max-time 5 "$s3_url" 2>/dev/null || true)
 
     case "$http_code" in
       200)
         finding "S3 BUCKET PUBLICLY READABLE: s3://${bucket} — ${s3_url}"
-        found_buckets+=("s3_public: $bucket")
+        echo "${bucket}" >> "${cloud_dir}/s3_public.txt"
         ;;
       403)
         # Bucket exists but access denied — still useful (confirms existence)
@@ -827,7 +1343,7 @@ EOF
     local gcp_url="https://storage.googleapis.com/${bucket}"
     local http_code
     http_code=$(curl -sk -o /dev/null -w "%{http_code}" \
-      --max-time 5 "$gcp_url" 2>/dev/null || echo "000")
+      --max-time 5 "$gcp_url" 2>/dev/null || true)
 
     case "$http_code" in
       200) finding "GCP BUCKET PUBLICLY READABLE: gs://${bucket} — ${gcp_url}" ;;
@@ -843,18 +1359,19 @@ EOF
     local azure_url="https://${bucket}.blob.core.windows.net"
     local http_code
     http_code=$(curl -sk -o /dev/null -w "%{http_code}" \
-      --max-time 5 "$azure_url" 2>/dev/null || echo "000")
+      --max-time 5 "$azure_url" 2>/dev/null || true)
 
     case "$http_code" in
-      200|400) # 400 = account exists but request malformed
-        echo "EXISTS: azure://${bucket}" >> "${cloud_dir}/azure_exists.txt"
-        verbose "Azure storage account exists: $bucket"
+      200|400)
+        # 400 is ambiguous on the legacy endpoint (also returned for a
+        # malformed name), so record the class rather than asserting existence.
+        echo "MAY_EXIST_${http_code}: azure://${bucket}" >> "${cloud_dir}/azure_exists.txt"
+        verbose "Azure storage account responded ${http_code}: $bucket"
         ;;
     esac
     sleep 0.2
   done < "${cloud_dir}/bucket_names.txt"
 
-  success "Cloud module complete — check ${cloud_dir}/ for results"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -874,7 +1391,7 @@ module_email() {
 
   if [[ "$spf_record" == "NONE" ]]; then
     finding "EMAIL: No SPF record found — email spoofing likely possible"
-  elif echo "$spf_record" | grep -qiE '~all|\\?all'; then
+  elif echo "$spf_record" | grep -qiE '~all|\?all'; then
     finding "EMAIL: SPF uses soft-fail (~all) or neutral (?all) — email spoofing MAY be possible"
   elif echo "$spf_record" | grep -qi '\-all'; then
     info "SPF: Strict (-all) — properly configured"
@@ -939,7 +1456,6 @@ module_email() {
   [[ -n "$mail_ip" ]] && \
     finding "EMAIL: mail.${DOMAIN} resolves to ${mail_ip} — dedicated mail server (often less patched)"
 
-  success "Email security module complete"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -957,7 +1473,7 @@ module_favicon() {
     local fav_url="https://${DOMAIN}${fav_path}"
     local http_code
     http_code=$(curl -sk -o "${fav_dir}/favicon_tmp" -w "%{http_code}" \
-      --max-time 10 "$fav_url" 2>/dev/null || echo "000")
+      --max-time 10 "$fav_url" 2>/dev/null || true)
 
     if [[ "$http_code" == "200" && -s "${fav_dir}/favicon_tmp" ]]; then
       info "Favicon found at: $fav_path"
@@ -1035,7 +1551,6 @@ PYEOF
     fi
   done
 
-  success "Favicon module complete"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1131,7 +1646,6 @@ module_ports() {
     done
   fi
 
-  success "Port scanning module complete"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1158,7 +1672,7 @@ module_vhost() {
   {
     # From CT results
     cat "${OUTPUT_DIR}/ct/ct_all_domains.txt" 2>/dev/null | \
-      grep "\.${DOMAIN}\$" | sed "s/\.${DOMAIN}\$//"
+      grep "\.$(domain_re)" | sed "s/\.$(domain_re)//"
 
     # Standard environment prefixes
     for prefix in dev staging stage test qa uat sandbox beta alpha preview demo old legacy backup internal intranet; do
@@ -1180,14 +1694,23 @@ module_vhost() {
 
   # Get baseline response size for filtering
   local baseline_size
+  # Same reasoning as the ffuf call below: resolve the apex to primary_ip but
+  # let the URL carry the hostname so SNI is correct.
   baseline_size=$(curl -sk -o /dev/null -w "%{size_download}" \
+    --connect-to "${DOMAIN}:443:${primary_ip}:443" \
     -H "Host: nonexistent-vhost-xyz.${DOMAIN}" \
-    "https://${primary_ip}/" 2>/dev/null || echo "0")
+    "https://${DOMAIN}/" 2>/dev/null || true)
 
   verbose "Baseline response size: ${baseline_size} bytes"
 
+  # SNI matters. The old probe put the raw IP in the URL, so the TLS handshake
+  # carried no server_name and the request landed on the DEFAULT vhost on every
+  # SNI-multiplexed front end (nginx server_name, ALB, Cloudflare, Fastly) —
+  # and then -fs "$baseline_size" discarded the results. Drive the fuzzed name
+  # through the URL so SNI follows it; --connect-to keeps the traffic aimed at
+  # primary_ip.
   ffuf -w "${vhost_dir}/vhost_candidates.txt" \
-    -u "https://${primary_ip}/" \
+    -u "https://FUZZ.${DOMAIN}/" \
     -H "Host: FUZZ.${DOMAIN}" \
     -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
     -fs "$baseline_size" \
@@ -1205,7 +1728,6 @@ module_vhost() {
       finding "VHOST: ${vhost_count} virtual hosts discovered on ${primary_ip} — potentially hidden apps"
   fi
 
-  success "Virtual host module complete"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1272,37 +1794,101 @@ PARAMS
     info "Install: pip install arjun --break-system-packages"
   fi
 
-  success "Parameter module complete"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE 11: JAVASCRIPT DEEP ANALYSIS
 # Your OMEGA pipeline integration point
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 0: HOST DISCOVERY
+# Owns the host inventory that six downstream modules iterate over. It used to
+# live inside module_js, and each of those six modules would *create* the file
+# with a single apex line when it was missing — so a run that covered one asset
+# instead of fifty was indistinguishable from a target that has one asset.
+# ─────────────────────────────────────────────────────────────────────────────
+module_discover() {
+  section "MODULE 0: Host Discovery (host inventory)"
+  local disc_dir="${OUTPUT_DIR}/discover"
+  local cands="${disc_dir}/candidates.txt"
+
+  # 1. Candidate names: apex + subdomains already known from CT / rDNS / Wayback
+  {
+    echo "${DOMAIN}"
+    [[ -s "${OUTPUT_DIR}/ct/ct_all_domains.txt" ]]   && cat "${OUTPUT_DIR}/ct/ct_all_domains.txt"
+    [[ -s "${OUTPUT_DIR}/dns/rdns_subdomains.txt" ]] && cat "${OUTPUT_DIR}/dns/rdns_subdomains.txt"
+    [[ -s "${OUTPUT_DIR}/wayback/wayback_subdomains.txt" ]] && cat "${OUTPUT_DIR}/wayback/wayback_subdomains.txt"
+  } 2>/dev/null | grep -E "^[A-Za-z0-9_.-]+$" | grep -iE "\\.$(dom_regex "$DOMAIN")$|^$(dom_regex "$DOMAIN")$" \
+    | sort -u > "$cands"
+  info "Candidate hostnames: $(count_lines "$cands")"
+
+  # 2. Passive resolution via dnsx
+  if require_tool dnsx && [[ -s "$cands" ]]; then
+    info "Resolving candidates..."
+    run_tool dnsx dnsx -l "$cands" -silent -a -o "${disc_dir}/resolved.txt" \
+      -t "$THREADS" >/dev/null 2>&1 || true
+    [[ -s "${disc_dir}/resolved.txt" ]] || module_note "dnsx resolved nothing"
+  else
+    module_note "dnsx missing — falling back to dig"
+    : > "${disc_dir}/resolved.txt"
+    while IFS= read -r h; do
+      [[ -z "$h" ]] && continue
+      printf '%s\n' "$h" >> "${disc_dir}/resolved.txt"
+    done < "$cands"
+  fi
+
+  # 3. Liveness with an explicit output format.
+  # httpx -silent output format varies by build. `-json` pins it: without it the
+  # inventory could contain lines like `https://host [200] [Title] [1234b]`,
+  # which every downstream `curl "$host"` would then treat as a URL.
+  : > "$HOSTS_FILE"
+  echo "https://${DOMAIN}" >> "$HOSTS_FILE"
+  if [[ -s "${disc_dir}/resolved.txt" ]] && require_tool httpx; then
+    info "Probing liveness..."
+    run_tool httpx httpx -l "${disc_dir}/resolved.txt" \
+      -json -silent -no-color -timeout 10 -threads "$THREADS" \
+      > "${disc_dir}/httpx.json" 2>/dev/null || true
+    if [[ -s "${disc_dir}/httpx.json" ]]; then
+      # Each line is a JSON object; take the "url" (falling back to host+scheme).
+      jq -r 'select(.failed != true) | (.url // (if (.scheme // "") == "https" then "https://" else "http://" end) + .host) | select(. != null and . != "")' \
+        "${disc_dir}/httpx.json" 2>/dev/null >> "$HOSTS_FILE" || true
+    else
+      module_note "httpx produced no JSON — inventory may be incomplete"
+    fi
+  fi
+
+  # Normalise: strip status/title decorations, keep only http(s) URLs.
+  sed -i -E 's/[[:space:]]+\[[0-9]{3}\].*$//; s/[[:space:]]+\[[^]]*\][[:space:]]*$//' "$HOSTS_FILE"
+  grep -E '^https?://' "$HOSTS_FILE" | sort -u > "${HOSTS_FILE}.tmp" && mv "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
+  [[ -s "$HOSTS_FILE" ]] || echo "https://${DOMAIN}" > "$HOSTS_FILE"
+
+  local live_count
+  live_count=$(count_lines "$HOSTS_FILE")
+  info "Host inventory: ${live_count} live host(s) -> $HOSTS_FILE"
+  if [[ $live_count -le 1 ]]; then
+    module_note "only the apex host resolved — downstream per-host coverage is 1 host"
+  fi
+  finding "DISCOVER: ${live_count} live hosts in inventory"
+}
+
 module_js() {
   section "MODULE 11: JavaScript Analysis & OMEGA Integration"
   local js_dir="${OUTPUT_DIR}/js"
 
-  # Collect all live hosts for JS analysis
-  # Always seed with apex domain — httpx results are additive
-  echo "https://${DOMAIN}" > "${js_dir}/live_hosts.txt"
-
-  # From CT subdomains (resolve and check live)
-  if [[ -s "${OUTPUT_DIR}/ct/ct_all_domains.txt" ]]; then
-    info "Resolving CT subdomains for JS analysis targets..."
-    if require_tool httpx; then
-      httpx -l "${OUTPUT_DIR}/ct/ct_all_domains.txt" \
-        -silent \
-        -timeout 10 \
-        -threads "$THREADS" \
-        2>/dev/null >> "${js_dir}/live_hosts.txt" || true
-    fi
+  # Host inventory comes from module `discover` (module 0). JS analysis consumes
+  # it rather than building its own.
+  local live_hosts="$HOSTS_FILE"
+  require_live_hosts
+  if require_tool httpx && [[ -s "${OUTPUT_DIR}/ct/ct_all_domains.txt" ]]; then
+    info "Adding any newly live CT subdomains to the inventory..."
+    httpx -l "${OUTPUT_DIR}/ct/ct_all_domains.txt" -json -silent -no-color \
+      -timeout 10 -threads "$THREADS" 2>/dev/null \
+      | jq -r '.url // empty' 2>/dev/null >> "$HOSTS_FILE" || true
+    grep -E '^https?://' "$HOSTS_FILE" | sort -u > "${HOSTS_FILE}.tmp" && mv "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
   fi
 
-  # Deduplicate and ensure file always exists with at least the apex
-  sort -u "${js_dir}/live_hosts.txt" -o "${js_dir}/live_hosts.txt" 2>/dev/null || true
   local live_count
-  live_count=$(count_lines "${js_dir}/live_hosts.txt")
+  live_count=$(count_lines "${HOSTS_FILE}")
   info "JS analysis targets: ${live_count} live hosts"
 
   # Extract JS URLs from each live host
@@ -1335,13 +1921,21 @@ module_js() {
   mkdir -p "${js_dir}/bundles"
   info "Downloading JS bundles (max 50 files)..."
   if [[ -s "${js_dir}/all_js_urls.txt" ]]; then
+    # Name files by URL digest, not basename. app.js/main.js/vendor.js are the
+    # most common basenames in existence, so basename-addressed files overwrote
+    # each other and the "max 50" download silently kept far fewer bundles. The
+    # URL->name map is written so the .map probe below can reuse it.
+    : > "${js_dir}/bundles/.urlmap"
     head -50 "${js_dir}/all_js_urls.txt" | while IFS= read -r js_url; do
-      local filename
-      filename=$(basename "$js_url" | cut -c1-60 | tr '?' '_' | tr '&' '_')
-      [[ -z "$filename" ]] && continue
+      local key filename
+      key=$(printf '%s' "$js_url" | md5sum | cut -c1-12)
+      filename=$(basename "${js_url%%\?*}" | cut -c1-48 | tr -c 'A-Za-z0-9._-' '_')
+      [[ -z "$filename" ]] && filename="bundle"
+      printf '%s\t%s\n' "$key" "$js_url" >> "${js_dir}/bundles/.urlmap"
       curl -skL --max-time 20 "$js_url" 2>/dev/null \
-        > "${js_dir}/bundles/${filename}" || true
+        > "${js_dir}/bundles/${key}_${filename}" || true
     done
+    verbose "Bundles also listed in ${OUTPUT_DIR}/js/bundles/.urlmap"
   else
     warn "No JS URLs collected — bundles dir will be empty"
   fi
@@ -1392,7 +1986,16 @@ module_js() {
     if [[ -f "$omega_path" ]]; then
       info "Found OMEGA at: $omega_path"
       info "Queuing OMEGA analysis..."
-      echo "python3 ${omega_path} --input-dir ${js_dir}/bundles/ --output ${js_dir}/omega_report/" \
+      # Single writer: run_integrations() wrote a DIFFERENT --input flag for the
+      # same file, so the last one to run silently decided the interface.
+      # Keep the --input-dir spelling (the more common omega_scan.py CLI) and
+      # detect the other spelling from the target file if we can.
+      local omega_flag="--input-dir"
+      if grep -qE 'add_argument\(.{0,4}--input\b(?!-dir)' "$omega_path" 2>/dev/null; then
+        omega_flag="--input"
+        module_note "OMEGA detected with --input flag"
+      fi
+      echo "python3 ${omega_path} ${omega_flag} ${js_dir}/bundles/ --output ${js_dir}/omega_report/" \
         > "${js_dir}/omega_run_command.sh"
       chmod +x "${js_dir}/omega_run_command.sh"
       finding "JS OMEGA: Run ${js_dir}/omega_run_command.sh to trigger full OMEGA analysis"
@@ -1400,7 +2003,6 @@ module_js() {
     fi
   done
 
-  success "JS module complete — bundles at ${js_dir}/bundles/, endpoints at ${js_dir}/extracted_endpoints.txt"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1426,7 +2028,7 @@ module_correlation() {
 
   # Identify acquisition candidates (domains in CT logs that don't match primary domain)
   if [[ -s "${OUTPUT_DIR}/ct/ct_all_domains.txt" ]]; then
-    grep -v "\.${DOMAIN}\$\|^${DOMAIN}\$" \
+    grep -v "\.$(domain_re)\|^$(domain_anchor_re)" \
       "${OUTPUT_DIR}/ct/ct_all_domains.txt" 2>/dev/null \
       > "${corr_dir}/acquisition_candidates.txt" || true
     local acq_count
@@ -1447,7 +2049,7 @@ module_correlation() {
         # Check if the target service is actually claimed
         local http_code
         http_code=$(curl -sk -o /dev/null -w "%{http_code}" \
-          --max-time 10 "https://${subdomain}" 2>/dev/null || echo "000")
+          --max-time 10 "https://${subdomain}" 2>/dev/null || true)
         if echo "$http_code" | grep -qE "^(404|410)"; then
           finding "TAKEOVER CANDIDATE: ${subdomain} → ${cname_chain} (HTTP ${http_code})"
           echo "${subdomain} CNAME ${cname_chain} HTTP:${http_code}" \
@@ -1476,7 +2078,6 @@ module_correlation() {
       finding "CORRELATION: ${corr_count} JS endpoints reference discovered infrastructure"
   fi
 
-  success "Correlation module complete"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1523,8 +2124,8 @@ module_supplemental() {
 
   # ── 14b. Well-known paths per live host ──────────────────────────────────
   info "Fetching well-known paths from live hosts..."
-  local live_hosts_file="${OUTPUT_DIR}/js/live_hosts.txt"
-  [[ ! -s "$live_hosts_file" ]] && echo "https://${DOMAIN}" > "$live_hosts_file"
+  local live_hosts_file="$HOSTS_FILE"
+  require_live_hosts
 
   local well_known_paths=(
     "/robots.txt"
@@ -1550,29 +2151,34 @@ module_supplemental() {
 
     for wk_path in "${well_known_paths[@]}"; do
       local url="${host}${wk_path}"
+      # Full path, not basename: /security.txt and /.well-known/security.txt both
+      # basename to "security.txt" and the second overwrote the first.
+      local wk_name
+      wk_name=$(printf '%s' "${wk_path}" | sed 's|^/||; s|/|_|g')
+      [[ -z "$wk_name" ]] && wk_name="root"
       local http_code
       http_code=$(curl -skL --max-time 8 -o \
-        "${sup_dir}/wellknown/${host_slug}/$(basename "${wk_path}").txt" \
-        -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+        "${sup_dir}/wellknown/${host_slug}/${wk_name}.txt" \
+        -w "%{http_code}" "$url" 2>/dev/null || true)
 
       if [[ "$http_code" == "200" ]]; then
         local file_size
         file_size=$(wc -c < \
-          "${sup_dir}/wellknown/${host_slug}/$(basename "${wk_path}").txt" \
+          "${sup_dir}/wellknown/${host_slug}/${wk_name}.txt" \
           2>/dev/null || echo 0)
         if [[ $file_size -gt 10 ]]; then
           finding "SUPP: ${wk_path} found at ${host} (${file_size} bytes)"
           # Mine robots.txt for hidden paths
           if [[ "$wk_path" == "/robots.txt" ]]; then
             grep -i "^Disallow:\|^Allow:" \
-              "${sup_dir}/wellknown/${host_slug}/$(basename "${wk_path}").txt" \
+              "${sup_dir}/wellknown/${host_slug}/${wk_name}.txt" \
               2>/dev/null | grep -v "^Disallow: /$\|^Disallow: $" \
               >> "${sup_dir}/dns/robots_paths.txt" || true
           fi
           # Mine OpenID config for auth endpoints
           if echo "$wk_path" | grep -q "openid\|oauth"; then
             jq -r 'to_entries[] | select(.value | type == "string") | .value' \
-              "${sup_dir}/wellknown/${host_slug}/$(basename "${wk_path}").txt" \
+              "${sup_dir}/wellknown/${host_slug}/${wk_name}.txt" \
               2>/dev/null | grep "^http" \
               >> "${sup_dir}/dns/oidc_endpoints.txt" || true
           fi
@@ -1596,8 +2202,14 @@ module_supplemental() {
   info "Auditing HTTP security headers per live host..."
   while IFS= read -r host; do
     [[ -z "$host" ]] && continue
+    # Header audit must use a real GET, not HEAD. Many origins and CDNs return a
+    # reduced header block on HEAD and frequently omit Set-Cookie entirely, so
+    # auditing HEAD produced confident-but-false "No CSP" / "No HSTS" / "cookie
+    # missing flags" findings -- and module_cve builds its tech fingerprint from
+    # this exact text. -D - captures the response headers, -o /dev/null discards
+    # the body; -L so a redirect does not hide the final origin's headers.
     local headers_raw
-    headers_raw=$(curl -skI --max-time 10 \
+    headers_raw=$(curl -skL --max-time 10 -D - -o /dev/null \
       -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
       "$host" 2>/dev/null || echo "")
 
@@ -1690,7 +2302,7 @@ module_supplemental() {
     options_response=$(curl -sk --max-time 8 -X OPTIONS \
       -o /dev/null -w "%{http_code}" \
       -D "${sup_dir}/headers/options_${host_label//\//_}.txt" \
-      "$host" 2>/dev/null || echo "000")
+      "$host" 2>/dev/null || true)
 
     if [[ "$options_response" == "200" ]]; then
       local allowed_methods
@@ -1708,27 +2320,34 @@ module_supplemental() {
   info "Checking for exposed source maps (.js.map)..."
   local js_bundles_dir="${OUTPUT_DIR}/js/bundles"
   if [[ -d "$js_bundles_dir" ]]; then
-    while IFS= read -r js_url; do
+    # Use the same digest-addressed names the bundles were downloaded under, so
+    # the map for a given bundle is unambiguous. The old code used
+    # `basename "${js_url}"` with no query stripping, producing a file literally
+    # named "app.js?v=1.map" and colliding across identical basenames.
+    local urlmap="${OUTPUT_DIR}/js/bundles/.urlmap"
+    [[ -f "$urlmap" ]] || : > "$urlmap"
+    while IFS=$'\t' read -r key js_url; do
       [[ -z "$js_url" ]] && continue
       local map_url="${js_url}.map"
+      local map_name="${key}_$(basename "${js_url%%\?*}" | cut -c1-40 | tr -c 'A-Za-z0-9._-' '_')"
       local http_code
       http_code=$(curl -sk --max-time 8 -o \
-        "${sup_dir}/sourcemaps/$(basename "${js_url}").map" \
-        -w "%{http_code}" "$map_url" 2>/dev/null || echo "000")
+        "${sup_dir}/sourcemaps/${map_name}.map" \
+        -w "%{http_code}" "$map_url" 2>/dev/null || true)
       if [[ "$http_code" == "200" ]]; then
         local map_size
-        map_size=$(wc -c < "${sup_dir}/sourcemaps/$(basename "${js_url}").map" 2>/dev/null || echo 0)
+        map_size=$(wc -c < "${sup_dir}/sourcemaps/${map_name}.map" 2>/dev/null || echo 0)
         if [[ $map_size -gt 100 ]]; then
           finding "SUPP SOURCEMAP: ${map_url} (${map_size} bytes) — original source recoverable"
           # Extract original file paths from source map
           jq -r '.sources[]?' \
-            "${sup_dir}/sourcemaps/$(basename "${js_url}").map" \
+            "${sup_dir}/sourcemaps/${map_name}.map" \
             2>/dev/null | head -20 \
             >> "${sup_dir}/sourcemaps/original_paths.txt" || true
         fi
       fi
       sleep 0.1
-    done < "${OUTPUT_DIR}/js/all_js_urls.txt" 2>/dev/null
+    done < "$urlmap" 2>/dev/null
   fi
 
   local sourcemap_count
@@ -1741,8 +2360,8 @@ module_supplemental() {
   local ct_subs="${OUTPUT_DIR}/ct/ct_all_domains.txt"
   if [[ -s "$ct_subs" ]] && require_tool alterx; then
     # Feed only subdomains (not apex) into alterx
-    grep "\.${DOMAIN}\$" "$ct_subs" 2>/dev/null \
-      | grep -v "^${DOMAIN}\$" \
+    grep "\.$(domain_re)" "$ct_subs" 2>/dev/null \
+      | grep -v "^$(domain_anchor_re)" \
       | head -50 \
       | alterx -silent 2>/dev/null \
       | grep -v "^${DOMAIN}\$" \
@@ -1887,7 +2506,7 @@ module_supplemental() {
     local http_code
     http_code=$(curl -sk --max-time 6 \
       -o /dev/null -w "%{http_code}" \
-      "https://${saas_target}" 2>/dev/null || echo "000")
+      "https://${saas_target}" 2>/dev/null || true)
 
     case "$http_code" in
       200|301|302|401|403)
@@ -1900,12 +2519,12 @@ module_supplemental() {
 
   # Firebase realtime DB check (open rules = critical)
   local base_name
-  base_name=$(echo "$DOMAIN" | rev | cut -d. -f2 | rev)
+  base_name=$(base_name "$DOMAIN")
   local firebase_url="https://${base_name}-default-rtdb.firebaseio.com/.json"
   local fb_code
   fb_code=$(curl -sk --max-time 8 \
     -o "${sup_dir}/saas/firebase_db.json" \
-    -w "%{http_code}" "$firebase_url" 2>/dev/null || echo "000")
+    -w "%{http_code}" "$firebase_url" 2>/dev/null || true)
 
   if [[ "$fb_code" == "200" ]]; then
     local fb_size
@@ -1917,7 +2536,7 @@ module_supplemental() {
   # ── 14i. GitHub dork list generator ──────────────────────────────────────
   info "Generating GitHub dork list for manual use..."
   local company_name
-  company_name=$(echo "$DOMAIN" | rev | cut -d. -f2 | rev)
+  company_name=$(base_name "$DOMAIN")
 
   cat > "${sup_dir}/dorks/github_dorks.txt" << DORKEOF
 # GitHub Dorks for: ${DOMAIN} / ${company_name}
@@ -2024,7 +2643,6 @@ DORKEOF
 # site:${DOMAIN} "internal use only"
 POSTEOF
 
-  success "Module 14 complete — see ${sup_dir}/"
   info "Key outputs:"
   info "  Headers audit:  ${sup_dir}/headers/header_audit.txt"
   info "  Source maps:    ${sup_dir}/sourcemaps/"
@@ -2033,6 +2651,50 @@ POSTEOF
   info "  SPF chain:      ${sup_dir}/spf/spf_chain.txt"
   info "  URLScan:        ${sup_dir}/urlscan/"
   info "  SaaS detection: ${sup_dir}/saas/detected.txt"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Report helpers
+# ─────────────────────────────────────────────────────────────────────────────
+# Render the per-module status records into a markdown table. This is the piece
+# that makes "ran and found nothing" distinguishable from "silently did nothing".
+coverage_table() {
+  local f line out=""
+  out+="| Module | State | Time | Tool errors | Note |"
+  out+=$'\n|---|---|---:|---:|---|'
+  for f in "${MODULE_STATUS_DIR}"/*.json; do
+    [[ -f "$f" ]] || { out+=$'\n| _(no modules ran)_ | | | | |'; break; }
+    local mod st sec err rsn
+    mod=$(jq -r '.module  // "?"' "$f" 2>/dev/null || echo "?")
+    st=$(jq  -r '.state   // "?"' "$f" 2>/dev/null || echo "?")
+    sec=$(jq -r '.seconds // 0' "$f" 2>/dev/null || echo 0)
+    err=$(jq -r '.tool_errors // 0' "$f" 2>/dev/null || echo 0)
+    rsn=$(jq -r '.reason  // ""' "$f" 2>/dev/null || echo "")
+    rsn="${rsn//|/\\|}"
+    out+=$'\n'"${mod} | **${st}** | ${sec}s | ${err} | ${rsn} |"
+  done
+  out+=$'\n'
+  printf '%s' "$out"
+}
+
+# A machine-readable roll-up, so the report can be diffed between runs.
+coverage_json() {
+  local f
+  local tgt
+  tgt=$(printf '%s' "$DOMAIN" | tr -d '\\"')
+  printf '{"target":"%s","requests":%s,"tool_errors":%s,"modules":{' \
+    "$tgt" "$REQUEST_COUNT" "$TOOL_ERRORS"
+  local first=1
+  for f in "${MODULE_STATUS_DIR}"/*.json; do
+    [[ -f "$f" ]] || continue
+    [[ $first -eq 1 ]] || printf ','
+    first=0
+    printf '"%s":{"state":"%s","seconds":%s,"tool_errors":%s,"reason":"%s"}' \
+      "$(jq -r '.module' "$f")" "$(jq -r '.state' "$f")" \
+      "$(jq -r '.seconds' "$f")" "$(jq -r '.tool_errors' "$f")" \
+      "$(jq -r '.reason' "$f" | tr -d '"\\')"
+  done
+  printf '}}\n'
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2051,7 +2713,24 @@ generate_report() {
 # Deep Recon Report: ${DOMAIN}
 **Generated:** $(date '+%Y-%m-%d %H:%M:%S')
 **Duration:** ${duration_min}m ${duration_sec}s
-**Modules:** ${MODULES}
+**Requested modules:** ${REQUESTED_MODULES}
+**Resolved modules:** ${MODULES}
+**Added by dependencies:** ${ADDED_MODULES}
+**Tier:** $([ "$PASSIVE_ONLY" == true ] && echo "passive-only" || echo "full")
+**Authorization:** $([ "$AUTHORIZED" == true ] && echo "declared (${AUTHZ_REF})" || echo "not declared")
+**Scope:** $([ -n "$SCOPE_CIDRS_FILE" ] && echo "operator-supplied, AUTHORITATIVE" || echo "none — ASN-derived ranges may be used")
+**Outbound requests:** ${REQUEST_COUNT} (budget ${REQUEST_BUDGET:-unlimited}), tool errors: ${TOOL_ERRORS}
+**Tool calls log:** ${TOOL_LOG}
+
+---
+
+## Coverage
+
+Every module records how it ended. A module that is DEGRADED or SKIPPED is
+NOT equivalent to a module that ran and found nothing — read this table before
+trusting a zero in the sections below.
+
+$(coverage_table)
 
 ---
 
@@ -2080,6 +2759,8 @@ $(cat "${OUTPUT_DIR}/findings_summary.txt" 2>/dev/null || echo "No findings reco
 ### Cloud Assets
 - S3 buckets (exist/public): $(count_lines "${OUTPUT_DIR}/cloud/s3_exists.txt" 2>/dev/null || echo 0) exist
 - GCP buckets: $(count_lines "${OUTPUT_DIR}/cloud/gcp_exists.txt" 2>/dev/null || echo 0) exist
+- S3 buckets PUBLICLY READABLE: $(count_lines "${OUTPUT_DIR}/cloud/s3_public.txt" 2>/dev/null || echo 0)
+- Azure storage accounts: $(count_lines "${OUTPUT_DIR}/cloud/azure_exists.txt" 2>/dev/null || echo 0) responded
 
 ### Email Security
 $(cat "${OUTPUT_DIR}/email/email_security.txt" 2>/dev/null || echo "Not run")
@@ -2096,7 +2777,7 @@ $(cat "${OUTPUT_DIR}/email/email_security.txt" 2>/dev/null || echo "Not run")
 - SPF chain depth: $(count_lines "${OUTPUT_DIR}/supplemental/spf/spf_chain.txt" 2>/dev/null || echo 0) entries
 - URLScan historical IPs: $(count_lines "${OUTPUT_DIR}/supplemental/urlscan/observed_ips.txt" 2>/dev/null || echo 0)
 - SaaS platforms detected: $(count_lines "${OUTPUT_DIR}/supplemental/saas/detected.txt" 2>/dev/null || echo 0)
-- GitHub dorks generated: $(grep -c "^\"" "${OUTPUT_DIR}/supplemental/dorks/github_dorks.txt" 2>/dev/null || echo 0)
+- GitHub dorks generated: $(grep -c "^\"" "${OUTPUT_DIR}/supplemental/dorks/github_dorks.txt" 2>/dev/null || true)
 
 ### Correlation
 - Master subdomain list: $(count_lines "${OUTPUT_DIR}/correlation/master_subdomains.txt" 2>/dev/null || echo 0)
@@ -2133,7 +2814,10 @@ ${OUTPUT_DIR}/
 \`\`\`
 REPORT_EOF
 
+  coverage_json > "${OUTPUT_DIR}/reports/coverage.json" 2>/dev/null || true
   success "Report written to: $report_file"
+  success "Coverage roll-up:   ${OUTPUT_DIR}/reports/coverage.json"
+  success "Run manifest:       ${STATE_DIR}/run_manifest.json"
   echo ""
   echo -e "${BOLD}${GREEN}════════════════════════════════════════${NC}"
   echo -e "${BOLD}${GREEN}  RECON COMPLETE${NC}"
@@ -2208,7 +2892,15 @@ module_monitor() {
           info "Subdomains: no change ($(wc -l < "$curr") total)"
         fi
       fi
-      cp "$curr" "$prev"
+      # Only advance the baseline when the collection actually produced data.
+      # The old unconditional cp meant a single failed subfinder run erased the
+      # baseline, and the next cycle reported every subdomain as new.
+      if [[ -s "$curr" ]]; then
+        cp "$curr" "$prev"
+      else
+        warn "subfinder returned nothing — previous baseline preserved"
+        module_note "one or more monitor collections returned empty; baselines preserved"
+      fi
     fi
 
     # ── New open ports on apex IP ───────────────────────────────────
@@ -2223,7 +2915,11 @@ module_monitor() {
         local new_ports; new_ports=$(comm -23 <(sort "$curr_ports") <(sort "$prev_ports"))
         [[ -n "$new_ports" ]] && monitor_alert "NEW_OPEN_PORTS" "$new_ports"
       fi
-      cp "$curr_ports" "$prev_ports"
+      if [[ -s "$curr_ports" ]]; then
+        cp "$curr_ports" "$prev_ports"
+      else
+        warn "naabu returned nothing — previous port baseline preserved"
+      fi
     fi
 
     # ── New CT certificates ─────────────────────────────────────────
@@ -2236,7 +2932,11 @@ module_monitor() {
       local new_certs; new_certs=$(comm -23 "$curr_certs" "$prev_certs")
       [[ -n "$new_certs" ]] && monitor_alert "NEW_CERTIFICATES" "$new_certs"
     fi
-    cp "$curr_certs" "$prev_certs"
+    if [[ -s "$curr_certs" ]]; then
+      cp "$curr_certs" "$prev_certs"
+    else
+      warn "crt.sh returned nothing — previous cert baseline preserved"
+    fi
 
     info "Cycle complete. Alerts: ${alert_dir}/"
   }
@@ -2346,8 +3046,13 @@ module_protocol() {
   local proto_dir="${OUTPUT_DIR}/protocol"
   mkdir -p "${proto_dir}"/{waf,jarm,graphql,api,websocket,smtp,origin,cache,dns_history}
 
-  local live_hosts="${OUTPUT_DIR}/js/live_hosts.txt"
-  [[ ! -s "$live_hosts" ]] && echo "https://${DOMAIN}" > "$live_hosts"
+  # Host inventory is owned by module `discover`. If it is absent we fall back to
+  # the apex host but RECORD that in the module status, so the run's report says
+  # "tested apex only" instead of silently presenting a 1-host result as a
+  # complete one. Previously this line created the file with no trace, and six
+  # modules would report a full-looking sweep over a single host.
+  local live_hosts="$HOSTS_FILE"
+  require_live_hosts
 
   # ── 15a. WAF / CDN fingerprinting ────────────────────────────────────────
   info "Fingerprinting WAF and CDN on live hosts..."
@@ -2355,8 +3060,10 @@ module_protocol() {
   waf_fingerprint() {
     local target="$1"
     local result_file="${proto_dir}/waf/$(echo "$target" | sed 's|https\?://||;s|/|_|g').txt"
+    # GET, not HEAD -- CDN/WAF fingerprinting keys on headers (cf-ray, x-cache,
+    # x-amz-cf-id, x-sucuri-id) that servers commonly omit on HEAD.
     local headers_raw
-    headers_raw=$(curl -skI --max-time 10 \
+    headers_raw=$(curl -skL --max-time 10 -D - -o /dev/null \
       -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
       "$target" 2>/dev/null || echo "")
 
@@ -2389,7 +3096,7 @@ module_protocol() {
         -o /dev/null -w "%{http_code}" \
         -H "User-Agent: Mozilla/5.0" \
         "${target}/?waf_test_param=<script>alert(1)</script>" \
-        2>/dev/null || echo "000")
+        2>/dev/null || true)
 
       echo "WAF probe response (XSS marker): HTTP ${waf_test_code}"
       if [[ "$waf_test_code" == "403" || "$waf_test_code" == "406" || \
@@ -2408,7 +3115,7 @@ module_protocol() {
         -H "X-Forwarded-For: 127.0.0.1" \
         -H "X-Real-IP: 127.0.0.1" \
         -H "True-Client-IP: 127.0.0.1" \
-        "${target}/admin" 2>/dev/null || echo "000")
+        "${target}/admin" 2>/dev/null || true)
       echo "X-Forwarded-For: 127.0.0.1 → /admin = HTTP ${xff_test_code}"
       [[ "$xff_test_code" == "200" || "$xff_test_code" == "301" || \
          "$xff_test_code" == "302" ]] && \
@@ -2432,113 +3139,246 @@ module_protocol() {
   # ── 15b. JARM TLS fingerprinting ─────────────────────────────────────────
   info "Computing JARM fingerprints for TLS correlation..."
 
-  python3 - "${DOMAIN}" "${proto_dir}/jarm/jarm_results.txt" << 'JARMEOF'
-import sys, socket, struct, hashlib, random, string
+  # JARM fingerprinting. Two independent defects used to live here:
+  #   1. the ServerHello parser read the cipher suite from hardcoded bytes
+  #      43:45, which is the session-id LENGTH byte, not the cipher (RFC 5246
+  #      §7.4.3: version(2) random(32) sid_len(1) sid(N) cipher(2) -- with a
+  #      32-byte sid the cipher is at offset 76);
+  #   2. the "JARM" was sha256(raw).hexdigest()[:62] -- raw hex of the wrong
+  #      length, not a JARM. A JARM is 32 characters: the first 32 hex digits
+  #      of the digest mapped through a base-32 alphabet. The old sentinel was
+  #      62 zeros while the guard tested 64, so the "no JARM" case was never
+  #      suppressed either.
+  # The ClientHello also omitted the extensions block entirely, so most modern
+  # stacks had nothing to negotiate against.
+  # If `tlsx` (ProjectDiscovery) is present we prefer its verified output.
+  local jarm_source="builtin"
+  if require_tool tlsx; then
+    if run_tool tlsx tlsx -u "${DOMAIN}" -san -cn -fp -silent 2>/dev/null \
+         | grep -qiE 'jarm|^[0-9A-Za-z]{32}$'; then
+      jarm_source="tlsx"
+    fi
+  fi
 
-def jarm_hash(fingerprint):
-    """Compute JARM hash from raw fingerprint string"""
-    if fingerprint == "|||,|||,|||,|||,|||,|||,|||,|||,|||,|||":
-        return "0" * 62
-    fuzzy = hashlib.sha256(fingerprint.encode()).hexdigest()
-    return fuzzy[:62]
+  python3 - "${DOMAIN}" "${proto_dir}/jarm/jarm_results.txt" "$jarm_source" << 'JARMEOF'
+import sys, socket, struct, hashlib, os
 
-def read_packet(sock, timeout=3):
-    sock.settimeout(timeout)
+DOMAIN = sys.argv[1]
+OUT    = sys.argv[2]
+SOURCE = sys.argv[3] if len(sys.argv) > 3 else "builtin"
+
+# RFC 5246 §7.4.3 ServerHello, with the length-prefixed session id honoured.
+def parse_server_hello(data: bytes):
+    """-> (version_hex, cipher_hex, ext_count_hex, alpn_hex) or None.
+
+    Layout: rec_type(1) rec_ver(2) rec_len(2) hs_type(1) hs_len(3)
+            server_version(2) random(32) session_id_len(1) session_id(N)
+            cipher_suite(2) compression(1) extensions_len(2) extensions(M)
+    """
+    if len(data) < 45 or data[0] != 0x16:          # handshake record
+        return None
+    hs_type = data[5]
+    if hs_type != 0x02:                            # ServerHello
+        return None
+    off = 9                                        # start of server_version
+    version = data[off:off+2]
+    off += 2 + 32                                  # skip random
+    if off >= len(data):
+        return None
+    sid_len = data[off]; off += 1                  # <-- the byte the old code
+    off += sid_len                                 #     read as the cipher
+    if off + 2 > len(data):
+        return None
+    cipher = data[off:off+2]
+    off += 2
+    if off >= len(data):
+        return None
+    off += 1                                       # compression_method
+    ext_count, alpn = 0, b""
+    if off + 2 <= len(data):
+        ext_total = struct.unpack(">H", data[off:off+2])[0]
+        off += 2
+        end = min(off + ext_total, len(data))
+        ext_count = 0
+        while off + 4 <= end:
+            etype, elen = struct.unpack(">HH", data[off:off+4])
+            ebody = data[off+4:off+4+elen]
+            off += 4 + elen
+            if etype == 0:
+                continue
+            ext_count += 1
+            if etype == 16 and len(ebody) >= 3:    # ALPN (RFC 7301)
+                # protocol_name_list = uint16 list_len; opaque name<1..2^16-1>
+                n = struct.unpack(">H", ebody[0:2])[0]
+                alpn = ebody[2:2+n]
+    return (version.hex(), cipher.hex(),
+            format(ext_count, "x").zfill(2) if ext_count else "00",
+            alpn.hex())
+
+
+def build_client_hello(host: str, sni: bool, alpn: list, versions: list,
+                       ciphers: list, sigalgs=True, grease=False):
+    """A ClientHello with a proper extensions block."""
+    ver = versions[0] if versions else 0x0303
+    body = ver.to_bytes(2, "big") + os.urandom(32) + b"\x00"
+    cb = b"".join(c.to_bytes(2, "big") for c in ciphers)
+    body += struct.pack(">H", len(cb)) + cb + b"\x01\x00"
+
+    ext = b""
+    if sni:
+        name = host.encode()
+        sni_ext = struct.pack(">H", len(name)) + name
+        ext += struct.pack(">HH", 0x0000, len(sni_ext)) + sni_ext
+    if sigalgs:
+        sig = b"\x04\x03\x08\x04\x04\x01\x05\x03\x08\x05\x05\x01"
+        ext += struct.pack(">HH", 0x000d, len(sig)) + sig
+    if alpn:
+        inner = b"".join(bytes([len(a)]) + a for a in alpn)
+        alpn_body = struct.pack(">H", len(inner)) + inner   # uint16 list_len
+        ext += struct.pack(">HH", 0x0010, len(alpn_body)) + alpn_body
+    if versions:
+        inner = b"".join(v.to_bytes(2, "big") for v in versions)
+        ext += struct.pack(">HH", 0x002b, len(inner)) + inner
+    ext += struct.pack(">HH", 0x000b, 2) + b"\x01\x00"   # ec_point_formats
+    body += struct.pack(">H", len(ext)) + ext
+
+    hs = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"\x16" + ver.to_bytes(2, "big") + len(hs).to_bytes(2, "big") + hs
+
+
+def send(host, port, hello, timeout=6):
     try:
-        data = b""
-        while True:
-            chunk = sock.recv(4096)
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.settimeout(timeout)
+        s.sendall(hello)
+        buf = b""
+        # Read until the handshake record is complete -- recv() may return a
+        # partial ServerHello, which is what the old 5-byte-ish read returned.
+        while len(buf) < 5:
+            chunk = s.recv(4096)
             if not chunk:
                 break
-            data += chunk
-            if len(data) > 5:
-                break
-    except Exception:
-        pass
-    return data
-
-def send_hello(host, port, tls_version, ciphers, extensions=""):
-    """Send a TLS ClientHello and return server response"""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5)
-        s.connect((host, port))
-
-        # Minimal TLS ClientHello
-        random_bytes = bytes([random.randint(0, 255) for _ in range(32)])
-        session_id = b"\x00"
-        cipher_bytes = b"".join([c.to_bytes(2, 'big') for c in ciphers])
-        cipher_len = len(cipher_bytes).to_bytes(2, 'big')
-        compression = b"\x01\x00"  # no compression
-
-        hello_body = (
-            tls_version.to_bytes(2, 'big') +
-            random_bytes + session_id +
-            cipher_len + cipher_bytes +
-            compression
-        )
-
-        hello_len = len(hello_body).to_bytes(3, 'big')
-        handshake = b"\x01" + hello_len + hello_body
-        record = b"\x16" + tls_version.to_bytes(2, 'big') + \
-                 len(handshake).to_bytes(2, 'big') + handshake
-        s.send(record)
-        resp = read_packet(s)
+            buf += chunk
+        if len(buf) >= 5:
+            want = 5 + struct.unpack(">H", buf[3:5])[0]
+            while len(buf) < want:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
         s.close()
-        return resp
+        return buf
     except Exception:
         return b""
 
-def extract_cipher_and_version(data):
-    """Extract selected cipher suite and version from ServerHello"""
-    if not data or len(data) < 10:
-        return "|||"
-    try:
-        # TLS record: type(1) ver(2) len(2) | handshake: type(1) len(3) body
-        if data[0] != 0x16 or data[5] != 0x02:
-            return "|||"
-        server_version = struct.unpack('>H', data[9:11])[0]
-        cipher = struct.unpack('>H', data[43:45])[0]
-        return f"{server_version:04x}|{cipher:04x}|"
-    except Exception:
-        return "|||"
 
-# JARM probe configurations: (version, cipher_list)
+TLS13 = [0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030]
+TLS12 = [0xc013, 0xc014, 0xc02f, 0xc02b, 0x009c, 0x009e, 0x0035, 0x002f]
+TLS11 = [0xc013, 0xc014, 0x0035, 0x002f, 0x000a]
+TLS10 = [0x0035, 0x002f, 0x000a]
+ECDHE  = [0xc02f, 0xc030, 0xc02b, 0xc02c]
+CHACHA = [0xcca8, 0xcca9]
+
 PROBES = [
-    (0x0303, [0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f]),  # TLS 1.3 modern
-    (0x0303, [0xc02b, 0xc02f, 0x009e, 0xcc14, 0xcc13]),  # TLS 1.2
-    (0x0301, [0x0035, 0x002f, 0x000a]),                   # TLS 1.0
-    (0x0302, [0xc013, 0xc014, 0x002f, 0x0035]),           # TLS 1.1
-    (0x0303, [0xc02c, 0xc030, 0x009f, 0xcc15]),           # TLS 1.2 alt
+    ("all TLS1.2 ciphers, 10 extensions", dict(versions=[0x0303], ciphers=TLS13 + TLS12 + ECDHE + CHACHA, alpn=[b"h2", b"http/1.1"])),
+    ("broad ciphers",                     dict(versions=[0x0303], ciphers=TLS12 + ECDHE + CHACHA, alpn=[b"h2", b"http/1.1"])),
+    ("elliptic curves only",              dict(versions=[0x0303], ciphers=ECDHE, alpn=[b"h2", b"http/1.1"])),
+    ("TLS1.0 legacy",                     dict(versions=[0x0301], ciphers=TLS10, alpn=[], sigalgs=False)),
+    ("TLS1.1 legacy",                     dict(versions=[0x0302], ciphers=TLS11, alpn=[], sigalgs=False)),
+    ("AES-GCM only",                      dict(versions=[0x0303], ciphers=[0x009c, 0x009d, 0xc02b, 0xc02f], alpn=[b"h2"])),
+    ("CHACHA20 only",                     dict(versions=[0x0303], ciphers=CHACHA, alpn=[b"h2"])),
+    ("no SNI",                            dict(versions=[0x0303], ciphers=TLS13 + TLS12, alpn=[b"h2", b"http/1.1"], sni=False)),
+    ("3DES/RC4 legacy",                   dict(versions=[0x0303], ciphers=[0x000a, 0x0035, 0x0005, 0x0004], alpn=[], sigalgs=False)),
+    ("TLS1.3 explicit",                   dict(versions=[0x0304, 0x0303], ciphers=[0x1301, 0x1302, 0x1303], alpn=[b"h2", b"http/1.1"])),
 ]
 
-domain = sys.argv[1]
-out_file = sys.argv[2]
-port = 443
+Y = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+ZERO_JARM = "0" * 32
 
-results = []
-for ver, ciphers in PROBES:
-    resp = send_hello(domain, port, ver, ciphers)
-    results.append(extract_cipher_and_version(resp))
 
-fingerprint = ",".join(results)
-jarm = jarm_hash(fingerprint)
+def compute_jarm(host, port=443):
+    parts = []
+    for label, kw in PROBES:
+        params = dict(sni=True, sigalgs=True, alpn=[b"h2", b"http/1.1"])
+        params.update(kw)
+        hello = build_client_hello(host, **params)
+        resp = send(host, port, hello)
+        parsed = parse_server_hello(resp)
+        if parsed is None:
+            parts.append("|||")          # no usable ServerHello
+        else:
+            v, c, e, a = parsed
+            parts.append(f"{v}|{c}|{e}|{a}|")
+    raw = ",".join(parts)
+    if raw == ",".join(["|||"] * 10):
+        return raw, ZERO_JARM, None
+    # JARM: first 32 hex digits of sha256(raw), each mapped through base32.
+    fuzzy = hashlib.sha256(raw.encode()).hexdigest()[:32]
+    return raw, "".join(Y[int(ch, 16)] for ch in fuzzy), None
 
-output = f"Domain: {domain}\nFingerprint: {fingerprint}\nJARM: {jarm}\n"
-output += f"\nShodan query: ssl.jarm:{jarm}\n"
-output += f"Censys query: services.tls.ja3s_fingerprint:{jarm}\n"
 
-with open(out_file, 'w') as f:
-    f.write(output)
+lines_out = []
+if SOURCE == "tlsx":
+    import subprocess
+    try:
+        r = subprocess.run(["tlsx", "-u", f"https://{DOMAIN}", "-silent", "-json"],
+                           capture_output=True, text=True, timeout=120)
+        import json
+        for o in r.stdout.splitlines():
+            try:
+                j = json.loads(o)
+            except Exception:
+                continue
+            val = j.get("jarm") or j.get("tls_data", {}).get("jarm")
+            if val and len(val) == 32:
+                lines_out += [f"Domain: {DOMAIN}", f"Fingerprint: (tlsx)",
+                              f"JARM: {val}", "",
+                              f"Shodan query: ssl.jarm:{val}", f"Source: tlsx"]
+                break
+    except Exception:
+        pass
 
-print(f"JARM: {jarm}")
+if not lines_out:
+    raw, jarm, _ = compute_jarm(DOMAIN)
+    lines_out = [
+        f"Domain: {DOMAIN}",
+        f"Fingerprint: {raw}",
+        f"JARM: {jarm}",
+        "",
+        f"Shodan query: ssl.jarm:{jarm}",
+        f"Censys query: services.tls.ja3s: NOT equivalent to JARM — "
+        f"JA3S is a different algorithm and is not emitted here.",
+        f"Source: {SOURCE}",
+    ]
+    print(f"JARM: {jarm}")
+else:
+    print("JARM: " + [l for l in lines_out if l.startswith("JARM: ")][0].split(": ", 1)[1])
+
+try:
+    with open(OUT, "w") as f:
+        f.write("\n".join(lines_out) + "\n")
+except OSError as exc:
+    print(f"cannot write {OUT}: {exc}", file=sys.stderr)
 JARMEOF
 
   if [[ -s "${proto_dir}/jarm/jarm_results.txt" ]]; then
     local jarm_hash
-    jarm_hash=$(grep "^JARM:" "${proto_dir}/jarm/jarm_results.txt" | awk '{print $2}')
-    [[ -n "$jarm_hash" && "$jarm_hash" != "0000000000000000000000000000000000000000000000000000000000000000" ]] && \
+    jarm_hash=$(grep "^JARM:" "${proto_dir}/jarm/jarm_results.txt" | head -1 | awk '{print $2}')
+    # A real JARM is 32 characters. Anything else means the probe did not get a
+    # usable ServerHello, and reporting it as a searchable hash would send the
+    # operator on a query that cannot match.
+    if [[ -z "$jarm_hash" ]]; then
+      warn "JARM: no value produced — see ${proto_dir}/jarm/jarm_results.txt"
+      module_note "JARM produced no value"
+    elif [[ ${#jarm_hash} -ne 32 ]]; then
+      warn "JARM: '${jarm_hash}' is ${#jarm_hash} chars, expected 32 — not a valid JARM, not reported"
+      module_note "JARM malformed (${#jarm_hash} chars)"
+    elif [[ "$jarm_hash" == "$(printf '0%.0s' {1..32})" ]]; then
+      warn "JARM: all-zero sentinel — every probe got no ServerHello (port filtered?)"
+      module_note "JARM all-zero (no ServerHello)"
+    else
       finding "PROTO JARM: ${jarm_hash} — use Shodan: ssl.jarm:${jarm_hash} to find related servers"
+    fi
   fi
 
   # ── 15c. GraphQL introspection ───────────────────────────────────────────
@@ -2568,15 +3408,15 @@ JARMEOF
       local gql_url="${host}${gql_path}"
 
       # Standard introspection
-      local gql_code gql_body
-      gql_body=$(curl -sk --max-time 10 \
+      local gql_status
+      gql_status=$(curl -sk --max-time 10 \
         -X POST "$gql_url" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json" \
         -d "$introspection_query" \
         -o "${proto_dir}/graphql/$(echo "${gql_url}" | \
           sed 's|https\?://||;s|/|_|g').json" \
-        -w "%{http_code}" 2>/dev/null || echo "000")
+        -w "%{http_code}" 2>/dev/null || true)
 
       local gql_resp
       gql_resp=$(cat "${proto_dir}/graphql/$(echo "${gql_url}" | \
@@ -2635,7 +3475,7 @@ JARMEOF
       local code
       code=$(curl -sk --max-time 8 \
         -H "Accept: application/json" \
-        -o /dev/null -w "%{http_code}" "$api_url" 2>/dev/null || echo "000")
+        -o /dev/null -w "%{http_code}" "$api_url" 2>/dev/null || true)
 
       case "$code" in
         200|201)
@@ -2651,8 +3491,9 @@ JARMEOF
           ;;
         301|302)
           local location
-          location=$(curl -skI --max-time 8 "$api_url" 2>/dev/null | \
-            grep -i "^location:" | head -1 | awk '{print $2}')
+          # GET not HEAD: some origins omit Location on a HEAD to a redirect.
+          location=$(curl -skL --max-time 8 -D - -o /dev/null "$api_url" 2>/dev/null | \
+            grep -i "^location:" | tail -1 | awk '{print $2}')
           echo "REDIRECT ${code}: ${api_url} → ${location}" >> "$api_results_file"
           ;;
         405)
@@ -2666,8 +3507,11 @@ JARMEOF
   done < "$live_hosts"
 
   local api_live_count
-  api_live_count=$(grep -rl "^LIVE\|^EXISTS" "${proto_dir}/api/" 2>/dev/null | \
-    xargs grep -h "^LIVE\|^EXISTS" 2>/dev/null | wc -l || echo 0)
+  # Single-process grep. The previous `grep -rl … | xargs grep -h …` invoked\
+  # grep with NO file operand whenever the outer grep matched nothing, so grep\
+  # read this script's own stdin: with a terminal it hung forever, with a\
+  # pipe it silently consumed the caller's data.\
+  api_live_count=$(grep -rh "^LIVE\|^EXISTS" "${proto_dir}/api/" 2>/dev/null | wc -l || true)
   [[ $api_live_count -gt 0 ]] && \
     finding "PROTO API: ${api_live_count} API version paths discovered across all hosts"
 
@@ -2692,11 +3536,11 @@ JARMEOF
         -H "Connection: Upgrade" \
         -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
         -H "Sec-WebSocket-Version: 13" \
-        "${host}${ws_path}" 2>/dev/null || echo "000")
+        "${ws_host}${ws_path}" 2>/dev/null || true)
 
       case "$upgrade_resp" in
         101)
-          finding "PROTO WS: WebSocket endpoint at ${host}${ws_path} (101 Switching Protocols)"
+          finding "PROTO WS: WebSocket endpoint at ${ws_host}${ws_path} (101 Switching Protocols)"
           echo "${host}${ws_path}" >> "${proto_dir}/websocket/ws_endpoints.txt"
           ;;
         200|400)
@@ -2812,7 +3656,7 @@ JARMEOF
         direct_code=$(curl -sk --max-time 8 \
           -H "Host: ${DOMAIN}" \
           -o /dev/null -w "%{http_code}" \
-          "https://${hist_ip}/" 2>/dev/null || echo "000")
+          "https://${hist_ip}/" 2>/dev/null || true)
         [[ "$direct_code" != "000" ]] && \
           finding "PROTO ORIGIN: Direct origin access: https://${hist_ip}/ responds (${direct_code}) with Host: ${DOMAIN}"
       fi
@@ -2908,13 +3752,18 @@ JARMEOF
 
   # Flag recently issued certs (new infrastructure = less hardened)
   local recent_certs
-  recent_certs=$(grep "^$(date +%Y)" \
-    "${proto_dir}/dns_history/ct_timeline.txt" 2>/dev/null | \
-    grep -v "^$(date +%Y-%m)" | wc -l || echo 0)
+# Was: grep "^YYYY" | grep -v "^YYYY-MM" -- the second grep removes exactly
+# what the first selected, so the count was always 0 and the finding never
+# fired. Count distinct certs issued this month and earlier this year.
+  local this_year this_month
+  this_year=$(date +%Y); this_month=$(date +%Y-%m)
+  recent_certs=$(awk -v y="$this_year" -v m="$this_month" \
+    '$1 ~ "^"y && $1 !~ "^"m {print $1" "$2}' \
+    "${proto_dir}/dns_history/ct_timeline.txt" 2>/dev/null | sort -u | wc -l || true)
+  recent_certs=${recent_certs:-0}
   [[ $recent_certs -gt 0 ]] && \
     finding "PROTO DNS: ${recent_certs} certs issued this year — new infrastructure, likely less hardened"
 
-  success "Module 15 complete — see ${proto_dir}/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2927,15 +3776,20 @@ module_intelligence() {
   local intel_dir="${OUTPUT_DIR}/intelligence"
   mkdir -p "${intel_dir}"/{mobile,priority,evasion,virustotal}
 
-  local live_hosts="${OUTPUT_DIR}/js/live_hosts.txt"
-  [[ ! -s "$live_hosts" ]] && echo "https://${DOMAIN}" > "$live_hosts"
+  # Host inventory is owned by module `discover`. If it is absent we fall back to
+  # the apex host but RECORD that in the module status, so the run's report says
+  # "tested apex only" instead of silently presenting a 1-host result as a
+  # complete one. Previously this line created the file with no trace, and six
+  # modules would report a full-looking sweep over a single host.
+  local live_hosts="$HOSTS_FILE"
+  require_live_hosts
 
   # ── 16a. APK static analysis ─────────────────────────────────────────────
   info "Checking for mobile app assets (APK static analysis)..."
 
   # Try to find APK from common URLs / Play Store
   local base_name
-  base_name=$(echo "$DOMAIN" | rev | cut -d. -f2 | rev)
+  base_name=$(base_name "$DOMAIN")
 
   # Google Play Store lookup (scrape app listing for package name)
   local play_data
@@ -2979,8 +3833,13 @@ module_intelligence() {
   chmod +x "${intel_dir}/mobile/apk_analysis_guide.sh"
 
   # If apktool is installed and an APK is in the working directory, auto-run
+  # Search the output directory, not the current working directory: the old
+  # `find . -maxdepth 2` picked up whatever .apk happened to be in the caller's
+  # cwd and reported that third-party app's endpoints and secrets as target
+  # findings. An explicit APK_PATH=/path/to.apk still overrides.
   local found_apk
-  found_apk=$(find . -maxdepth 2 -name "*.apk" 2>/dev/null | head -1)
+  found_apk=$(find "${OUTPUT_DIR}" -maxdepth 2 -name "*.apk" 2>/dev/null | head -1)
+  [[ -z "$found_apk" && -n "${APK_PATH:-}" && -f "${APK_PATH}" ]] && found_apk="$APK_PATH"
   if [[ -n "$found_apk" ]] && require_tool apktool; then
     info "APK found: $found_apk — decompiling..."
     apktool d "$found_apk" \
@@ -3201,7 +4060,7 @@ PYEOF
 
   if [[ -s "${intel_dir}/priority/priority_report.txt" ]]; then
     local scored_count
-    scored_count=$(grep -c "^[0-9]" "${intel_dir}/priority/priority_report.txt" || echo 0)
+    scored_count=$(grep -c "^[0-9]" "${intel_dir}/priority/priority_report.txt" 2>/dev/null || true); scored_count=${scored_count:-0}
     finding "INTEL PRIORITY: ${scored_count} assets scored — report: ${intel_dir}/priority/priority_report.txt"
     # Print top 3
     echo ""
@@ -3225,9 +4084,15 @@ PYEOF
 
   if [[ "$waf_detected" == true ]]; then
     info "WAF detected — running control validation probes..."
+    EVASION_TIER="active"
   else
-    info "No WAF confirmed — running baseline encoding tests..."
+    # The old code ran the SAME probes in both branches, so the WAF detection
+    # was purely decorative. It is now explicit: probes still run, but a
+    # "bypass" finding is only raised when a WAF was actually confirmed.
+    info "No WAF confirmed — running baseline encoding tests (no bypass findings will be raised)"
+    EVASION_TIER="baseline"
   fi
+  local EVASION_TIER
 
   local primary_host
   primary_host=$(head -1 "$live_hosts")
@@ -3238,6 +4103,8 @@ PYEOF
     echo "# Each probe uses a harmless marker — not a weaponized payload"
     echo ""
 
+    # tests_passed was never incremented, so the summary line reported
+    # "N blocked / N tested" for every run. It is now the real denominator.
     local tests_passed=0 tests_blocked=0
 
     run_evasion_test() {
@@ -3247,16 +4114,17 @@ PYEOF
       if [[ "$method" == "GET" ]]; then
         code=$(curl -sk --max-time 8 \
           -H "User-Agent: Mozilla/5.0" \
-          -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+          -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || true)
       else
         code=$(curl -sk --max-time 8 \
           -X "$method" -d "$data" \
           -H "Content-Type: application/x-www-form-urlencoded" \
           -H "User-Agent: Mozilla/5.0" \
-          -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+          -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || true)
       fi
 
       local result
+      ((tests_passed++))
       if [[ "$code" == "403" || "$code" == "406" || \
             "$code" == "412" || "$code" == "429" ]]; then
         result="BLOCKED(${code})"
@@ -3268,9 +4136,12 @@ PYEOF
       fi
       echo "  ${name}: ${result}"
 
-      # Flag bypass as finding
-      if [[ "$result" == PASSED* ]]; then
+      # Flag bypass as a finding ONLY when a WAF is known to be present —
+      # otherwise a 200 just means the host has no WAF, which is not a finding.
+      if [[ "$result" == PASSED* && "$EVASION_TIER" == "active" ]]; then
         finding "EVASION: WAF bypass — ${name} not blocked on ${primary_host}"
+      elif [[ "$result" == PASSED* ]]; then
+        echo "  (no WAF confirmed — not reported as a bypass)"
       fi
     }
 
@@ -3300,7 +4171,7 @@ PYEOF
       -H "X-Real-IP: 127.0.0.1" \
       -H "X-Originating-IP: 127.0.0.1" \
       -o /dev/null -w "%{http_code}" \
-      "${primary_host}/admin" 2>/dev/null || echo "000")
+      "${primary_host}/admin" 2>/dev/null || true)
     echo "  XFF localhost → /admin: HTTP ${xff_bypass_code}"
     [[ "$xff_bypass_code" == "200" ]] && \
       finding "EVASION: XFF spoofing to 127.0.0.1 bypasses /admin (200)"
@@ -3312,7 +4183,7 @@ PYEOF
       method_code=$(curl -sk --max-time 8 \
         -X "$method" \
         -o /dev/null -w "%{http_code}" \
-        "$primary_host" 2>/dev/null || echo "000")
+        "$primary_host" 2>/dev/null || true)
       echo "  ${method}: HTTP ${method_code}"
       [[ "$method" == "TRACE" && "$method_code" == "200" ]] && \
         finding "EVASION: TRACE method enabled on ${primary_host} — XST possible"
@@ -3327,7 +4198,7 @@ PYEOF
       -H "Content-Type: text/plain" \
       -d '{"key":"<script>alert(1)</script>"}' \
       -o /dev/null -w "%{http_code}" \
-      "${primary_host}/api" 2>/dev/null || echo "000")
+      "${primary_host}/api" 2>/dev/null || true)
     echo "  JSON body with text/plain Content-Type → /api: HTTP ${ct_code}"
 
     echo ""
@@ -3336,26 +4207,42 @@ PYEOF
   } > "${intel_dir}/evasion/waf_validation_report.txt"
 
   local evasion_finding_count
-  evasion_finding_count=$(grep -c "EVASION:" "${OUTPUT_DIR}/findings_summary.txt" 2>/dev/null || echo 0)
+  evasion_finding_count=$(grep -c "EVASION:" "${OUTPUT_DIR}/findings_summary.txt" 2>/dev/null || true); evasion_finding_count=${evasion_finding_count:-0}
   info "WAF validation complete — ${evasion_finding_count} bypass findings"
 
   # ── 16d. VirusTotal passive lookup ───────────────────────────────────────
-  info "Querying VirusTotal for domain reputation and history..."
-
-  # VT public API (no key needed for basic info)
-  local vt_data
-  vt_data=$(rate_limited_curl \
-    "https://www.virustotal.com/api/v3/domains/${DOMAIN}" \
-    -H "x-apikey: " 2>/dev/null || true)
-
-  # Fallback: scrape VT community page (no API key)
-  if [[ -z "$vt_data" ]] || echo "$vt_data" | grep -qi "forbidden\|unauthorized"; then
+  # The old code called the v3 API with an empty x-apikey, then called the
+  # retired /vtapi/v2/ endpoint, then never read EITHER response: vt_data was
+  # assigned twice and used zero times. The section produced no VirusTotal data
+  # at all while logging as if it had. Now the key comes from the environment
+  # and the response is actually parsed; without a key the module says so.
+  if [[ -n "$VT_API_KEY" ]]; then
+    info "Querying VirusTotal for domain reputation and history..."
+    local vt_data
     vt_data=$(rate_limited_curl \
-      "https://www.virustotal.com/vtapi/v2/domain/report?apikey=&domain=${DOMAIN}" \
-      2>/dev/null || true)
+      "https://www.virustotal.com/api/v3/domains/${DOMAIN}" \
+      -H "x-apikey: ${VT_API_KEY}" 2>/dev/null || true)
+    if [[ -n "$vt_data" ]] && echo "$vt_data" | jq -e '.data.attributes' >/dev/null 2>&1; then
+      echo "$vt_data" | jq '.' > "${intel_dir}/virustotal/vt_domain.json" 2>/dev/null || true
+      local vt_stats
+      vt_stats=$(echo "$vt_data" | jq -c '.data.attributes.last_analysis_stats // empty' 2>/dev/null || true)
+      local vt_reputation
+      vt_reputation=$(echo "$vt_data" | jq -r '.data.attributes.reputation // "n/a"' 2>/dev/null || echo "n/a")
+      if [[ -n "$vt_stats" ]]; then
+        echo "reputation: ${vt_reputation}" >> "${intel_dir}/virustotal/vt_summary.txt"
+        echo "last_analysis_stats: ${vt_stats}" >> "${intel_dir}/virustotal/vt_summary.txt"
+        finding "INTEL VT: VirusTotal reputation ${vt_reputation} — ${intel_dir}/virustotal/vt_summary.txt"
+      fi
+    else
+      warn "VirusTotal: API returned no usable payload (key rejected?)"
+      module_note "VT_API_KEY set but v3 lookup returned nothing"
+    fi
+  else
+    info "VirusTotal: skipped — set VT_API_KEY to enable (no keyless access exists)"
+    module_note "VT skipped (no VT_API_KEY)"
   fi
 
-  # Use urlscan as VirusTotal proxy (always free)
+  # urlscan is a genuinely keyless source and is the real historical signal here.
   local vt_urlscan
   vt_urlscan=$(rate_limited_curl \
     "https://urlscan.io/api/v1/search/?q=domain:${DOMAIN}&size=5" \
@@ -3407,7 +4294,6 @@ PYEOF
     grep "^[0-9]" "${intel_dir}/priority/priority_report.txt" 2>/dev/null | head -10
   } > "${intel_dir}/attack_surface_map.txt"
 
-  success "Module 16 complete — see ${intel_dir}/"
   success "Priority report: ${intel_dir}/priority/priority_report.txt"
   success "Evasion report:  ${intel_dir}/evasion/waf_validation_report.txt"
   success "Attack surface:  ${intel_dir}/attack_surface_map.txt"
@@ -3422,8 +4308,13 @@ module_auth() {
   local auth_dir="${OUTPUT_DIR}/auth"
   mkdir -p "${auth_dir}"/{login,oauth,jwt,saml,session,ratelimit}
 
-  local live_hosts="${OUTPUT_DIR}/js/live_hosts.txt"
-  [[ ! -s "$live_hosts" ]] && echo "https://${DOMAIN}" > "$live_hosts"
+  # Host inventory is owned by module `discover`. If it is absent we fall back to
+  # the apex host but RECORD that in the module status, so the run's report says
+  # "tested apex only" instead of silently presenting a 1-host result as a
+  # complete one. Previously this line created the file with no trace, and six
+  # modules would report a full-looking sweep over a single host.
+  local live_hosts="$HOSTS_FILE"
+  require_live_hosts
 
   # 17a. Login endpoint discovery
   info "Discovering authentication endpoints..."
@@ -3446,7 +4337,7 @@ module_auth() {
       local code
       code=$(curl -skL --max-time 8 \
         -o "${auth_dir}/login/.tmp_body" \
-        -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+        -w "%{http_code}" "$url" 2>/dev/null || true)
       case "$code" in
         200|301|302)
           local title
@@ -3474,8 +4365,8 @@ module_auth() {
   done < "$live_hosts"
 
   local auth_found
-  auth_found=$(grep -rl "^FOUND" "${auth_dir}/login/" 2>/dev/null | \
-    xargs grep -h "^FOUND" 2>/dev/null | wc -l || echo 0)
+  # Single-process grep; see the note on api_live_count above.\
+  auth_found=$(grep -rh "^FOUND" "${auth_dir}/login/" 2>/dev/null | wc -l || true)
   finding "AUTH: ${auth_found} authentication endpoints discovered"
   local field_count
   field_count=$(sort -u "${auth_dir}/login/form_fields.txt" 2>/dev/null | wc -l || echo 0)
@@ -3499,7 +4390,7 @@ module_auth() {
       code=$(curl -skL --max-time 8 \
         -H "Accept: application/json" \
         -o "${auth_dir}/oauth/.tmp_oauth" \
-        -w "%{http_code}" "${host}${oauth_path}" 2>/dev/null || echo "000")
+        -w "%{http_code}" "${host}${oauth_path}" 2>/dev/null || true)
       body=$(cat "${auth_dir}/oauth/.tmp_oauth" 2>/dev/null || echo "")
       if [[ "$code" == "200" ]]; then
         echo "${host}${oauth_path}" >> "${auth_dir}/oauth/endpoints.txt"
@@ -3574,14 +4465,16 @@ lines = [f"JWT Analysis: {len(findings)} tokens\n"]
 for e in findings:
     lines += [f"File: {e['file']}", f"Alg:  {e['alg']}", f"ISS:  {e['iss']}",
               f"JWT:  {e['jwt']}"]
-    if e['flags']: lines.append(f"!!    {' | '.join(e['flags'])}")
+    # The playbook generator tests for the literal "FLAGS:"; it previously
+    # wrote "!!", so the JWT section of playbook.md was never generated.
+    if e['flags']: lines.append(f"FLAGS: {' | '.join(e['flags'])}")
     lines.append("")
 out.write_text('\n'.join(lines))
 print(f"Analyzed {len(findings)} JWTs")
 JWTEOF
 
   local jwt_count
-  jwt_count=$(grep -c "^File:" "${auth_dir}/jwt/analysis.txt" 2>/dev/null || echo 0)
+  jwt_count=$(grep -c "^File:" "${auth_dir}/jwt/analysis.txt" 2>/dev/null || true); jwt_count=${jwt_count:-0}
   [[ $jwt_count -gt 0 ]] && \
     finding "AUTH JWT: ${jwt_count} JWT tokens in JS bundles — ${auth_dir}/jwt/analysis.txt"
   grep -q "CRITICAL\|WEAK\|NO-EXPIRY" "${auth_dir}/jwt/analysis.txt" 2>/dev/null && \
@@ -3606,6 +4499,15 @@ JWTEOF
   if [[ ${#sso_providers[@]} -gt 0 ]]; then
     local pstr; pstr=$(printf '%s, ' "${sso_providers[@]}" | sed 's/, $//')
     finding "AUTH SSO: Providers: ${pstr}"
+    # The playbook reads this file, and it was never written — only the finding
+    # line existed, in a different file. The header string the playbook greps
+    # for is "SSO Providers:", so it has to be here verbatim.
+    {
+      echo "SSO Providers: ${pstr}"
+      echo "Checked: ${primary_host}"
+    } > "${auth_dir}/session/sso_fingerprint.txt"
+  else
+    : > "${auth_dir}/session/sso_fingerprint.txt"
   fi
   echo "$page" | grep -qiE "totp|authenticator|2fa|mfa|two.factor" && \
     finding "AUTH MFA: MFA references found in page source"
@@ -3623,7 +4525,7 @@ JWTEOF
       code=$(curl -sk --max-time 5 -X POST "$login_url" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -d "email=test${i}@example.com&password=wrong${i}" \
-        -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+        -o /dev/null -w "%{http_code}" 2>/dev/null || true)
       if [[ "$code" == "429" || "$code" == "423" ]]; then
         finding "AUTH RATELIMIT: Throttled at request ${i} (${code}) on ${login_url}"
         throttled=true; break
@@ -3634,7 +4536,6 @@ JWTEOF
       finding "AUTH RATELIMIT: No throttling detected on ${login_url} — brute force possible"
   fi
 
-  success "Module 17 complete — ${auth_dir}/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3722,7 +4623,7 @@ TECHEOF
   python3 - "${cve_dir}/tech/stack.json" \
              "${cve_dir}/nvd/cve_results.json" \
              "${cve_dir}/nvd/high_severity.txt" << 'NVDEOF'
-import sys, json, urllib.request, urllib.parse, time
+import os, sys, json, urllib.request, urllib.parse, urllib.error, time
 from pathlib import Path
 
 stack    = json.loads(Path(sys.argv[1]).read_text())
@@ -3730,19 +4631,40 @@ out_json = Path(sys.argv[2])
 out_high = Path(sys.argv[3])
 all_cves, high_sev = {}, []
 
+# NVD documents 5 requests / 30 s WITHOUT an API key and 50 / 30 s WITH one.
+# The old code slept 1.5 s (20 req/30 s) while its own comment said 5/30, so
+# NVD 403'd partway through the list and the bare `except: continue` hid it:
+# the report looked complete but was truncated at an unpredictable point.
+NVD_KEY = os.environ.get("NVD_API_KEY", "")
+NVD_SLEEP = 0.7 if NVD_KEY else 6.2
+NVD_HEADERS = {"User-Agent": "deep_recon/1.0"}
+if NVD_KEY:
+    NVD_HEADERS["apiKey"] = NVD_KEY
+_rate_limited = 0
+_exhausted = False
+
 for tech_key, tech_info in list(stack.items())[:12]:
+    if _exhausted:
+        break
     name    = tech_info["name"]
     version = tech_info["versions"][0] if tech_info["versions"] else "unknown"
-    time.sleep(1.5)  # NVD: 5 req/30s unauthenticated
+    time.sleep(NVD_SLEEP)
     try:
         q = f"{name} {version}" if version != "unknown" else name
         url = "https://services.nvd.nist.gov/rest/json/cves/2.0?" + \
               urllib.parse.urlencode({"keywordSearch": q, "resultsPerPage": "5"})
-        req = urllib.request.Request(url,
-              headers={"User-Agent": "deep_recon/1.0"})
+        req = urllib.request.Request(url, headers=NVD_HEADERS)
         with urllib.request.urlopen(req, timeout=12) as r:
             data = json.loads(r.read())
-    except Exception: continue
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 429):
+            _exhausted = True
+            print(f"NVD rate limit hit (HTTP {exc.code}) after "
+                  f"{_rate_limited} requests — report is PARTIAL", file=sys.stderr)
+        continue
+    except Exception:
+        continue
+    _rate_limited += 1
 
     tech_cves = []
     for item in data.get("vulnerabilities", []):
@@ -3771,12 +4693,16 @@ for e in sorted(high_sev, key=lambda x: x["cvss"], reverse=True):
     lines.append(f"[{e['severity']:<8} {e['cvss']:<5}] {e['cve_id']} — {e['tech']} {e['version']}")
     lines.append(f"  {e['desc']}")
     lines.append("")
+if _exhausted:
+    lines.insert(2, f"!! PARTIAL: NVD rate limit reached after {_rate_limited} "
+                    f"requests — set NVD_API_KEY for the full 50/30s rate.")
 out_high.write_text('\n'.join(lines))
-print(f"Found {len(high_sev)} high-severity CVEs")
+print(f"Found {len(high_sev)} high-severity CVEs"
+      + (" (PARTIAL - rate limited)" if _exhausted else ""))
 NVDEOF
 
   local high_cve_count
-  high_cve_count=$(grep -c "^\[" "${cve_dir}/nvd/high_severity.txt" 2>/dev/null || echo 0)
+  high_cve_count=$(grep -c "^\[" "${cve_dir}/nvd/high_severity.txt" 2>/dev/null || true); high_cve_count=${high_cve_count:-0}
   [[ $high_cve_count -gt 0 ]] && \
     finding "CVE: ${high_cve_count} HIGH/CRITICAL CVEs in tech stack — ${cve_dir}/nvd/high_severity.txt"
 
@@ -3843,7 +4769,6 @@ NVDEOF
       finding "CVE DEPS: ${dep_count} scoped packages — check npm for dependency confusion"
   fi
 
-  success "Module 18 complete — ${cve_dir}/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3855,7 +4780,7 @@ module_osint() {
   mkdir -p "${osint_dir}"/{github,email,linkedin,breach,paste,acquisitions}
 
   local base_name
-  base_name=$(echo "$DOMAIN" | rev | cut -d. -f2 | rev)
+  base_name=$(base_name "$DOMAIN")
 
   # 19a. GitHub org and employee mapping
   info "Mapping GitHub organization..."
@@ -3979,7 +4904,7 @@ PASTEEOF
       [[ -z "$ext_domain" ]] && continue
       local lcode
       lcode=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
-        "https://${ext_domain}" 2>/dev/null || echo "000")
+        "https://${ext_domain}" 2>/dev/null || true)
       [[ "$lcode" != "000" && "$lcode" != "404" ]] && \
         echo "LIVE ${lcode}: ${ext_domain}" >> \
           "${osint_dir}/acquisitions/live_external.txt"
@@ -3995,7 +4920,7 @@ PASTEEOF
   for eng_blog in "engineering.${DOMAIN}" "tech.${DOMAIN}" "${base_name}.engineering"; do
     local blog_code
     blog_code=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
-      "https://${eng_blog}" 2>/dev/null || echo "000")
+      "https://${eng_blog}" 2>/dev/null || true)
     [[ "$blog_code" != "000" && "$blog_code" != "404" ]] && \
       finding "OSINT: Engineering blog: https://${eng_blog} (${blog_code}) — architecture intel"
   done
@@ -4016,7 +4941,6 @@ https://www.sec.gov/cgi-bin/browse-edgar?company=${base_name}&action=getcompany
 DEVEOF
   finding "OSINT: Developer intel sheet: ${osint_dir}/github/developer_intel.txt"
 
-  success "Module 19 complete — ${osint_dir}/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4030,8 +4954,13 @@ module_content() {
   local cd_dir="${OUTPUT_DIR}/content"
   mkdir -p "${cd_dir}"/{wordlists,results,backups,apis}
 
-  local live_hosts="${OUTPUT_DIR}/js/live_hosts.txt"
-  [[ ! -s "$live_hosts" ]] && echo "https://${DOMAIN}" > "$live_hosts"
+  # Host inventory is owned by module `discover`. If it is absent we fall back to
+  # the apex host but RECORD that in the module status, so the run's report says
+  # "tested apex only" instead of silently presenting a 1-host result as a
+  # complete one. Previously this line created the file with no trace, and six
+  # modules would report a full-looking sweep over a single host.
+  local live_hosts="$HOSTS_FILE"
+  require_live_hosts
 
   # ── 20a. Build target-specific wordlist from all collected data ───────────
   info "Building target-specific wordlist from collected intelligence..."
@@ -4120,7 +5049,10 @@ words.update(standard)
 
 # Environment permutations of discovered paths
 env_prefixes = ["dev","staging","stage","test","qa","uat","sandbox","beta","alpha"]
-base_words   = list(words)[:100]  # permute top 100
+# Was `list(words)[:100]`: `words` is a set, so iteration order depends on
+# per-process hash randomisation and the chosen 100 changed on every run. Sort
+# deterministically: longest first (more specific), then alphabetical.
+base_words   = sorted(words, key=lambda w: (-len(w), w))[:100]
 for word in base_words:
     for prefix in env_prefixes:
         words.add(f"{prefix}-{word}")
@@ -4166,7 +5098,7 @@ WORDEOF
       local baseline_size
       baseline_size=$(curl -skL --max-time 8 \
         "${host}/definitely-does-not-exist-xyz-12345" \
-        -o /dev/null -w "%{size_download}" 2>/dev/null || echo "0")
+        -o /dev/null -w "%{size_download}" 2>/dev/null || true)
 
       # Main content discovery
       ffuf -w "${cd_dir}/wordlists/merged.txt" \
@@ -4230,10 +5162,10 @@ WORDEOF
         local url="${host}/${fname}${ext}"
         local code size
         code=$(curl -sk --max-time 6 \
-          -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+          -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || true)
         if [[ "$code" == "200" ]]; then
           size=$(curl -sk --max-time 6 \
-            -o /dev/null -w "%{size_download}" "$url" 2>/dev/null || echo "0")
+            -o /dev/null -w "%{size_download}" "$url" 2>/dev/null || true)
           if [[ $size -gt 50 ]]; then
             echo "FOUND ${code} ${size}b: ${url}" | tee -a "$backup_results"
             finding "CONTENT BACKUP: ${url} (${size} bytes) — potential source/config leak"
@@ -4254,11 +5186,11 @@ WORDEOF
       "/crossdomain.xml" "/clientaccesspolicy.xml"; do
       local code size
       code=$(curl -sk --max-time 6 \
-        -o /dev/null -w "%{http_code}" "${host}${special}" 2>/dev/null || echo "000")
+        -o /dev/null -w "%{http_code}" "${host}${special}" 2>/dev/null || true)
       if [[ "$code" == "200" ]]; then
         size=$(curl -sk --max-time 6 \
           -o /dev/null -w "%{size_download}" \
-          "${host}${special}" 2>/dev/null || echo "0")
+          "${host}${special}" 2>/dev/null || true)
         [[ $size -gt 10 ]] && \
           finding "CONTENT CRITICAL: ${host}${special} (${code}, ${size}b)"
       fi
@@ -4312,7 +5244,6 @@ WORDEOF
     done < "$live_hosts"
   fi
 
-  success "Module 20 complete — ${cd_dir}/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4360,7 +5291,7 @@ module_metadata() {
   info "Downloading and extracting document metadata..."
 
   python3 - "$doc_urls_file" "${meta_dir}" << 'METAEOF'
-import sys, re, struct, urllib.request, urllib.error
+import sys, re, struct, zlib, ssl, io, zipfile, urllib.request, urllib.error
 from pathlib import Path
 
 doc_urls_file = Path(sys.argv[1])
@@ -4373,12 +5304,20 @@ if not doc_urls_file.exists():
 
 urls = [u.strip() for u in doc_urls_file.read_text().splitlines() if u.strip()][:30]
 
+# Bound the download. The old fetch() called r.read() with no cap, so a
+# "document" URL serving 2 GB exhausted memory. 8 MB is far above any real
+# PDF/OOXML and well below anything hostile.
+MAX_DOC_BYTES = 8 << 20
+
 def fetch(url, timeout=12):
     try:
         req = urllib.request.Request(url,
             headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE     # targets with self-signed certs
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            return r.read(MAX_DOC_BYTES)
     except Exception:
         return b""
 
@@ -4388,7 +5327,10 @@ def extract_pdf_metadata(data, url):
     if not data.startswith(b'%PDF'):
         return None
 
-    text = data[:65536].decode('latin-1', errors='ignore')
+    # Scan the WHOLE buffer, not the first 64 KB: the Info dictionary can sit
+    # anywhere in the file. (Object streams may still be Flate-compressed, so
+    # this is a best-effort pass -- see the inflate attempt below.)
+    text = data.decode('latin-1', errors='ignore')
     patterns = {
         "Author":   r'/Author\s*\(([^)]{1,100})\)',
         "Creator":  r'/Creator\s*\(([^)]{1,100})\)',
@@ -4404,6 +5346,29 @@ def extract_pdf_metadata(data, url):
             val = m.group(1).replace('\r','').replace('\n','').strip()
             if val:
                 meta["fields"][field] = val
+
+    # PDF 1.5+ stores the Info dictionary in an object stream that is Flate
+    # compressed, so the regex pass above finds nothing on a modern PDF. Inflate
+    # every stream and retry.
+    if not meta["fields"]:
+        # NB: no underscore separators in the quantifier. `.{0,4_000_000}?`
+        # COMPILES but silently never matches, because re does not accept `_`
+        # inside `{m,n}` — the whole compressed-stream branch was a no-op.
+        for blob in re.findall(rb'stream\r?\n(.{0,4000000}?)\r?\nendstream',
+                               data, re.S):
+            for attempt in (blob, blob.strip(b'\r\n')):
+                try:
+                    inflated = zlib.decompress(attempt)
+                except zlib.error:
+                    continue
+                t2 = inflated.decode('latin-1', errors='ignore')
+                for field, pat in patterns.items():
+                    m = re.search(pat, t2)
+                    if m:
+                        val = m.group(1).replace('\r', '').replace('\n', '').strip()
+                        if val:
+                            meta["fields"][field] = val
+                break
 
     # Look for internal paths and hostnames
     internal = re.findall(
@@ -4421,27 +5386,47 @@ def extract_office_metadata(data, url):
     if not data[:4] == b'PK\x03\x04':
         return None
 
-    # Scan for XML metadata in ZIP content (without unzipping)
-    text = data.decode('latin-1', errors='ignore')
+    # DECOMPRESS. OOXML (ECMA-376 / OPC) entries are DEFLATE-compressed ZIP
+    # members. The old code did `data.decode('latin-1')` over the raw container
+    # and regexed for <dc:creator> — which is only visible for a STORED
+    # (uncompressed) zip. Word, Excel and PowerPoint all deflate by default, so
+    # the Office half of this module produced nothing for every real document.
+    import io, zipfile
+    candidates = ["docProps/core.xml", "docProps/app.xml"]
+    xml_text = ""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for name in candidates:
+                if name in zf.namelist():
+                    xml_text += zf.read(name).decode("utf-8", errors="ignore")
+    except zipfile.BadZipFile:
+        # Fall back to a raw scan: covers OLE2 .doc/.xls/.ppt and STORED zips.
+        xml_text = data.decode("latin-1", errors="ignore")
+
     patterns = {
-        "dc:creator":        r'<dc:creator>([^<]{1,80})</dc:creator>',
-        "dc:title":          r'<dc:title>([^<]{1,80})</dc:title>',
-        "dc:subject":        r'<dc:subject>([^<]{1,80})</dc:subject>',
+        "Author":            r'<dc:creator>([^<]{1,80})</dc:creator>',
+        "Title":             r'<dc:title>([^<]{1,80})</dc:title>',
+        "Subject":           r'<dc:subject>([^<]{1,80})</dc:subject>',
+        # Written under the FULL key: the old code stored field.split(':')[1],
+        # i.e. "lastModifiedBy", while the report below looked for the literal
+        # "cp:lastModifiedBy" — so the Office author-leak finding could never fire.
         "cp:lastModifiedBy": r'<cp:lastModifiedBy>([^<]{1,80})</cp:lastModifiedBy>',
         "cp:revision":       r'<cp:revision>([^<]{1,10})</cp:revision>',
         "dc:description":    r'<dc:description>([^<]{1,120})</dc:description>',
+        "Application":       r'<Application>([^<]{1,80})</Application>',
+        "Company":           r'<Company>([^<]{1,80})</Company>',
     }
     for field, pat in patterns.items():
-        m = re.search(pat, text)
+        m = re.search(pat, xml_text)
         if m:
             val = m.group(1).strip()
             if val:
-                meta["fields"][field.split(':')[1]] = val
+                meta["fields"][field] = val
 
-    # Look for embedded paths
-    paths = re.findall(r'[A-Za-z]:\\[^<>"]{4,60}', text)
+    # Look for embedded paths (and now also inside the decompressed XML)
+    paths = re.findall(r'[A-Za-z]:\\[^<>"]{4,60}', xml_text)
     if paths:
-        meta["fields"]["WindowsPaths"] = list(set(paths))[:5]
+        meta["fields"]["WindowsPaths"] = sorted(set(paths))[:5]
 
     return meta if meta["fields"] else None
 
@@ -4475,7 +5460,7 @@ for m in all_meta:
     for k, v in m["fields"].items():
         report_lines.append(f"  {k}: {v}")
         # Flag high-value intel
-        if k in ("Author","Creator","cp:lastModifiedBy"):
+        if k in ("Author", "Creator", "cp:lastModifiedBy", "Application", "Company"):
             intel_found.append(f"AUTHOR: {v} — from {m['url']}")
         if k in ("InternalPaths","WindowsPaths"):
             intel_found.append(f"PATH LEAK: {v} — from {m['url']}")
@@ -4542,25 +5527,59 @@ def extract_jpeg_exif(data):
     while i < len(data) - 4:
         if data[i] != 0xFF: break
         marker = data[i+1]
+        # Standalone markers carry no length field; skipping 2+length over them
+        # reads a bogus length and can run off the end of the buffer.
+        if marker in (0xD8, 0xD9, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        if marker == 0xDA:      # start of scan: entropy-coded data follows
+            break
         length = struct.unpack('>H', data[i+2:i+4])[0]
+        if length < 2:
+            break
         if marker == 0xE1:  # APP1 = EXIF
             exif = data[i+4:i+2+length]
             if exif[:6] in (b'Exif\x00\x00', b'Exif\x00\xff'):
                 tiff = exif[6:]
-                # Extract make/model strings (ASCII tags)
-                for tag, name in [(0x010F,"Make"),(0x0110,"Model"),
-                                   (0x0131,"Software"),(0x013B,"Artist"),
-                                   (0x8298,"Copyright"),(0x0132,"DateTime")]:
-                    for offset in range(0, min(len(tiff)-12, 4096), 2):
-                        try:
-                            t = struct.unpack_from('<H', tiff, offset)[0]
-                            if t == tag:
-                                val_len = struct.unpack_from('<I', tiff, offset+4)[0]
-                                val_off = struct.unpack_from('<I', tiff, offset+8)[0]
-                                val = tiff[val_off:val_off+val_len].decode('ascii',
-                                      errors='ignore').strip('\x00')
-                                if val: meta[name] = val
-                        except: pass
+                # TIFF 6.0: the byte-order mark decides endianness. "II" is
+                # little-endian, "MM" is big-endian. The old parser hardcoded
+                # '<H'/'<I', so a big-endian TIFF (used by a number of camera and
+                # scanner vendors) had its BOM read as a tag id and produced no
+                # metadata at all — silently.
+                if len(tiff) < 8:
+                    i += 2 + length
+                    continue
+                bo = tiff[0:2]
+                if bo == b'II':
+                    en = '<'
+                elif bo == b'MM':
+                    en = '>'
+                else:
+                    i += 2 + length
+                    continue
+                ifd_off = struct.unpack_from(en + 'I', tiff, 4)[0]
+                n_entries = struct.unpack_from(en + 'H', tiff, ifd_off)[0]
+                n_entries = min(n_entries, 512)
+                for k in range(n_entries):
+                    try:
+                        base = ifd_off + 2 + k * 12
+                        tag, typ, cnt = struct.unpack_from(en + 'HHI', tiff, base)
+                        voff = base + 8
+                        for _t, _n in ((0x010F,"Make"),(0x0110,"Model"),
+                                       (0x0131,"Software"),(0x013B,"Artist"),
+                                       (0x8298,"Copyright"),(0x0132,"DateTime")):
+                            if tag != _t:
+                                continue
+                            if cnt * 2 > 4:        # value does not fit inline
+                                val_off = struct.unpack_from(en + 'I', tiff, voff)[0]
+                            else:
+                                val_off = voff
+                            val = tiff[val_off:val_off+cnt].decode('ascii',
+                                  errors='ignore').strip('\x00').strip()
+                            if val:
+                                meta[_n] = val
+                    except (struct.error, IndexError):
+                        pass
         i += 2 + length
     return meta
 
@@ -4584,7 +5603,6 @@ EXIFEOF
   [[ -s "${meta_dir}/images/exif_results.txt" ]] && \
     finding "META EXIF: GPS/camera/author data in public images — ${meta_dir}/images/exif_results.txt"
 
-  success "Module 21 complete — ${meta_dir}/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4598,8 +5616,13 @@ module_deepproto() {
   local dp_dir="${OUTPUT_DIR}/deepproto"
   mkdir -p "${dp_dir}"/{smuggling,soap,ldap,snmp,mqtt,ssrf}
 
-  local live_hosts="${OUTPUT_DIR}/js/live_hosts.txt"
-  [[ ! -s "$live_hosts" ]] && echo "https://${DOMAIN}" > "$live_hosts"
+  # Host inventory is owned by module `discover`. If it is absent we fall back to
+  # the apex host but RECORD that in the module status, so the run's report says
+  # "tested apex only" instead of silently presenting a 1-host result as a
+  # complete one. Previously this line created the file with no trace, and six
+  # modules would report a full-looking sweep over a single host.
+  local live_hosts="$HOSTS_FILE"
+  require_live_hosts
 
   # ── 22a. HTTP request smuggling surface detection ─────────────────────────
   info "Probing HTTP request smuggling surface..."
@@ -4619,7 +5642,7 @@ module_deepproto() {
         -H "Transfer-Encoding: chunked" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         --data-binary $'3\r\nabc\r\n0\r\n\r\n' \
-        -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+        -o /dev/null -w "%{http_code}" 2>/dev/null || true)
       echo "CL.TE probe: HTTP ${cl_te_code}"
 
       # TE.CL probe
@@ -4630,7 +5653,7 @@ module_deepproto() {
         -H "Content-Length: 4" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         --data-binary $'5\r\nhello\r\n0\r\n\r\n' \
-        -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+        -o /dev/null -w "%{http_code}" 2>/dev/null || true)
       echo "TE.CL probe: HTTP ${te_cl_code}"
 
       # TE.TE obfuscation probe
@@ -4640,16 +5663,16 @@ module_deepproto() {
         -H "Transfer-Encoding: chunked" \
         -H "Transfer-Encoding: x-obfuscated" \
         --data-binary $'0\r\n\r\n' \
-        -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+        -o /dev/null -w "%{http_code}" 2>/dev/null || true)
       echo "TE.TE obfuscation probe: HTTP ${te_te_code}"
 
       # HTTP/2 downgrade check
       local h2_code
       h2_code=$(curl -sk --max-time 8 --http2 \
-        -o /dev/null -w "%{http_code}" "$host" 2>/dev/null || echo "000")
+        -o /dev/null -w "%{http_code}" "$host" 2>/dev/null || true)
       local h11_code
       h11_code=$(curl -sk --max-time 8 --http1.1 \
-        -o /dev/null -w "%{http_code}" "$host" 2>/dev/null || echo "000")
+        -o /dev/null -w "%{http_code}" "$host" 2>/dev/null || true)
       echo "HTTP/2: ${h2_code} | HTTP/1.1: ${h11_code}"
 
       # H2C upgrade attempt (cleartext HTTP/2)
@@ -4658,7 +5681,7 @@ module_deepproto() {
         -H "Upgrade: h2c" \
         -H "HTTP2-Settings: AAMAAABkAAQAAP__" \
         -H "Connection: Upgrade, HTTP2-Settings" \
-        -o /dev/null -w "%{http_code}" "$host" 2>/dev/null || echo "000")
+        -o /dev/null -w "%{http_code}" "$host" 2>/dev/null || true)
       echo "H2C upgrade: HTTP ${h2c_code}"
       [[ "$h2c_code" == "101" ]] && \
         finding "PROTO SMUG: H2C upgrade accepted on ${host} — potential h2c smuggling"
@@ -4692,13 +5715,14 @@ module_deepproto() {
   while IFS= read -r host; do
     [[ -z "$host" ]] && continue
     for soap_path in "${soap_paths[@]}"; do
-      local code body
-      body=$(curl -skL --max-time 8 \
+      # Was: `body=$(... -w "%{http_code}")` then `code=$(cat .tmp_soap)`, so the
+      # name `code` held the RESPONSE BODY and the status lived in `body`; `code`
+      # was never read. Names now say what they hold.
+      local http_code
+      http_code=$(curl -skL --max-time 8 \
         -H "Accept: text/xml,application/xml" \
         -o "${dp_dir}/soap/.tmp_soap" \
-        -w "%{http_code}" "${host}${soap_path}" 2>/dev/null || echo "000")
-      code=$(cat "${dp_dir}/soap/.tmp_soap" 2>/dev/null || echo "")
-      local http_code="$body"
+        -w "%{http_code}" "${host}${soap_path}" 2>/dev/null || true)
 
       if [[ "$http_code" == "200" ]]; then
         local resp_body
@@ -4729,30 +5753,53 @@ module_deepproto() {
   info "Checking for LDAP exposure..."
   local ldap_ips=()
 
-  # Gather IPs from port scan results
-  for scan_file in $(ls "${OUTPUT_DIR}/ports/"*.txt 2>/dev/null); do
+  # Gather IPs from port scan results.
+  # The collection used to be `grep … | while read; do ldap_ips+=(…); done`, and
+  # because `while` is the last element of a pipeline it runs in a SUBSHELL: the
+  # array increment was discarded, `[[ ${#ldap_ips[@]} -gt 0 ]]` was therefore
+  # always false, and the module printed "No LDAP ports found in port scan
+  # results" — a false statement about the cause, even when naabu_results.txt
+  # plainly contained a :389 line. mapfile reads in the current shell.
+  local scan_files=()
+  while IFS= read -r f; do scan_files+=("$f"); done < <(ls "${OUTPUT_DIR}/ports/"*.txt 2>/dev/null || true)
+  if [[ ${#scan_files[@]} -eq 0 ]]; then
+    module_note "no port-scan artifacts in ports/ — LDAP/SNMP/MQTT probes had no input"
+  fi
+  for scan_file in "${scan_files[@]}"; do
     [[ -f "$scan_file" ]] || continue
-    grep -E ":389|:636|:3268|:3269" "$scan_file" 2>/dev/null | \
-      grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
-      while IFS= read -r ip; do ldap_ips+=("$ip"); done
+    local got
+    got=$(grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=.*:389|:389|:636|:3268|:3269)' "$scan_file" 2>/dev/null || true)
+    grep -E ':(389|636|3268|3269)\b' "$scan_file" 2>/dev/null \
+      | grep -oP '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' >> "${dp_dir}/ldap/.ldap_ips.tmp" || true
   done
+  if [[ -s "${dp_dir}/ldap/.ldap_ips.tmp" ]]; then
+    mapfile -t ldap_ips < <(sort -u "${dp_dir}/ldap/.ldap_ips.tmp")
+  fi
+  rm -f "${dp_dir}/ldap/.ldap_ips.tmp"
 
   if [[ ${#ldap_ips[@]} -gt 0 ]]; then
+    info "LDAP ports on ${#ldap_ips[@]} host(s): ${ldap_ips[*]}"
     for ldap_ip in "${ldap_ips[@]}"; do
       info "LDAP probe: ${ldap_ip}"
       {
         echo "=== LDAP Probe: ${ldap_ip} ==="
-        # Anonymous bind test via bash TCP
+        # Anonymous bind test via bash TCP. The packet below is byte-correct per
+        # RFC 4511 §4.2: SEQUENCE(12){ INTEGER msgID=1, BindRequest[APPLICATION 0]
+        # (7){ INTEGER version=3, OCTETSTRING name="" (0), auth[0] SIMPLE "" (0) } }
         local ldap_resp
         ldap_resp=$(timeout 8 bash -c \
           "exec 3<>/dev/tcp/${ldap_ip}/389
-           # Minimal LDAP anonymous bind request
            printf '\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00' >&3
-           sleep 1; cat <&3" 2>/dev/null | xxd | head -5 || echo "no response")
+           sleep 1; cat <&3" 2>/dev/null | hexdump | head -5 || true)
 
         echo "Anonymous bind response: ${ldap_resp}"
+        # BindResponse success = tag 0x0a, length 0x01, resultCode 0x00.
         if echo "$ldap_resp" | grep -q "0a 01 00"; then
           finding "PROTO LDAP: Anonymous bind SUCCESS on ${ldap_ip}:389 — CRITICAL"
+        elif echo "$ldap_resp" | grep -q "0a"; then
+          echo "BindResponse received but NOT success (introspection) — see dump above"
+        else
+          echo "No BindResponse — port open but no LDAP answer, or filtered"
         fi
 
         # ldapsearch if available
@@ -4762,44 +5809,120 @@ module_deepproto() {
             >> "${dp_dir}/ldap/namingcontexts_${ldap_ip}.txt" || true
           local nc_count
           nc_count=$(count_lines \
-            "${dp_dir}/ldap/namingcontexts_${ldap_ip}.txt" 2>/dev/null || echo 0)
+            "${dp_dir}/ldap/namingcontexts_${ldap_ip}.txt")
           [[ $nc_count -gt 0 ]] && \
             finding "PROTO LDAP: Naming contexts exposed on ${ldap_ip}"
+        else
+          module_note "ldapsearch missing — no namingContexts dump"
         fi
       } >> "${dp_dir}/ldap/probe_${ldap_ip}.txt"
     done
   else
-    info "No LDAP ports found in port scan results — skipping"
+    if [[ ${#scan_files[@]} -eq 0 ]]; then
+      info "No port-scan results to search for LDAP (run module 'ports' first)"
+    else
+      info "No LDAP ports (389/636/3268/3269) in port scan results — skipping"
+    fi
   fi
 
   # ── 22d. SNMP community string probing ────────────────────────────────────
   info "Probing SNMP on discovered IPs..."
   local scan_ips=()
-  [[ -f "${OUTPUT_DIR}/asn/domain_ips.txt" ]] && \
-    mapfile -t scan_ips < "${OUTPUT_DIR}/asn/domain_ips.txt"
-  [[ -f "${OUTPUT_DIR}/asn/ipv4_cidrs.txt" ]] && \
-    scan_ips+=($(head -1 "${OUTPUT_DIR}/asn/ipv4_cidrs.txt" | \
-      cut -d'/' -f1 2>/dev/null || echo ""))
+  # Only real host addresses. The old code also appended
+  # `head -1 ipv4_cidrs.txt | cut -d'/' -f1`, which is a NETWORK address such as
+  # 104.16.0.0 (not a host), and it inherited any IPv6 literal that
+  # module_asn had appended to domain_ips.txt.
+  if [[ -f "${OUTPUT_DIR}/asn/domain_ips.txt" ]]; then
+    mapfile -t scan_ips < <(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "${OUTPUT_DIR}/asn/domain_ips.txt")
+  fi
+  [[ ${#scan_ips[@]} -eq 0 ]] && module_note "no IPv4 targets for SNMP/MQTT probes"
 
   local community_strings=("public" "private" "community" "manager"
                             "admin" "monitor" "snmp" "cisco" "default")
 
+  # SNMPv2c GetRequest for sysDescr (1.3.6.1.2.1.1.1.0).
+  #
+  # Structure per RFC 1157 §4.1 / RFC 3416 §4.1:
+  #   Msg      ::= SEQUENCE { version=v2c(0), community OCTET STRING,
+  #                           get-request-pdu }
+  #   PDU      ::= [0] IMPLICIT SEQUENCE { request-id, non-repeaters,
+  #                           max-repetitions, varbindlist }
+  #   VarBind  ::= SEQUENCE { name OID, value NULL }
+  #
+  # The old packet hardcoded the two enclosing lengths (\x30\x26 / \xa0\x19)
+  # while computing the community length dynamically. \xa0\x19 is correct for
+  # every community, but \x30\x26 is correct only for a SIX-byte community --
+  # i.e. exactly "public", the first string tried. The other eight iterations
+  # sent a PDU whose declared message length was short by (len-6) bytes, so a
+  # device requiring "private" could never be found. Every length is derived
+  # here.
+  snmp_get_request() {
+    local comm="$1"
+    local comm_esc comm_len msg_len_hex msg_body pdu_len_hex
+    # The community must be re-encoded as \xNN escapes, not as raw hex text:
+    # printf '%b' expands \xNN, so a bare "7075626c6963" would go out as twelve
+    # literal ASCII characters instead of six bytes.
+    comm_esc=$(printf '%s' "$comm" | od -An -tx1 | tr ' ' '\n' | grep -v '^$' | sed 's/^/\\x/' | tr -d '\n')
+    [[ -z "$comm_esc" ]] && return 1
+    comm_len=$(( (${#comm_esc} + 3) / 4 ))
+    printf -v comm_len_hex '\\x%02x' "$comm_len"
+    printf -v pdu_len_hex '\\x%02x' 25          # 3+3+3 + 16-byte varbind list
+    # PDU content: request-id 0, non-repeaters 0, max-repetitions 0, varbindlist
+    pdu_body="\x02\x01\x00\x02\x01\x00\x02\x01\x00\x30\x0e\x30\x0c\x06\x08\x2b\x06\x01\x02\x01\x01\x01\x00\x05\x00"
+    # Msg content: version 0, community, PDU  =>  3 + (2+len) + 27  =  32 + len
+    msg_body="\x02\x01\x00\x04${comm_len_hex}${comm_esc}\xa0${pdu_len_hex}${pdu_body}"
+    printf -v msg_len_hex '\\x%02x' "$(( 32 + comm_len ))"
+    # %b, not %s: printf expands \xNN only in a format that goes through %b.
+    printf '%b' "\\x30${msg_len_hex}${msg_body}"
+  }
+
+  # Validate that the builder agrees with an independent reference. If this ever
+  # prints a mismatch, do not trust the findings.
+  snmp_selftest() {
+    local c p declared actual
+    for c in public private community default; do
+      p=$(snmp_get_request "$c")
+      actual=$(printf '%b' "$p" | od -An -tx1 | tr -d ' \n')
+      declared=$(printf '%s' "$actual" | cut -c3-4)
+      local n=$(( ${#actual} / 2 - 3 ))
+      if [[ $((16#$declared)) -ne $n ]]; then
+        warn "SNMP builder self-test FAILED for '${c}': declared ${declared} != actual ${n}"
+        return 1
+      fi
+    done
+    verbose "SNMP packet builder self-test passed"
+    return 0
+  }
+  snmp_selftest || module_note "SNMP packet self-test FAILED — SNMP findings suppressed"
+
   for snmp_ip in "${scan_ips[@]}"; do
     [[ -z "$snmp_ip" ]] && continue
+    in_scope_ip "$snmp_ip" || { verbose "SNMP: ${snmp_ip} out of scope, skipped"; continue; }
     for community in "${community_strings[@]}"; do
-      # SNMP v1/v2c get-request via bash (OID 1.3.6.1.2.1.1.1.0 = sysDescr)
+      local packet
+      packet=$(snmp_get_request "$community") || continue
       local snmp_resp
-      snmp_resp=$(timeout 3 bash -c \
+      snmp_resp=$(timeout 4 bash -c \
         "exec 3<>/dev/udp/${snmp_ip}/161
-         # Minimal SNMPv1 GetRequest for sysDescr
-         printf '\x30\x26\x02\x01\x00\x04$(printf '\\x%02x' ${#community})${community}\xa0\x19\x02\x01\x00\x02\x01\x00\x02\x01\x00\x30\x0e\x30\x0c\x06\x08\x2b\x06\x01\x02\x01\x01\x01\x00\x05\x00' >&3
-         sleep 1; cat <&3" 2>/dev/null | \
-        strings | head -3 || echo "")
-      if [[ -n "$snmp_resp" ]] && ! echo "$snmp_resp" | grep -q "^$"; then
+         printf '%b' '${packet}' >&3
+         sleep 1; cat <&3" 2>/dev/null | od -An -tx1 | tr -d ' \n' || true)
+
+      # A working community yields a GetResponse (PDU tag 0xa2) whose first
+      # varbind value is an OCTET STRING (0x06) carrying sysDescr. A rejected
+      # community yields an error response, and an unreachable agent yields
+      # nothing. The old test was "did any bytes come back", so any agent that
+      # answered — including one rejecting the community — produced
+      # "Community 'public' works" and then `break`, so the other eight strings
+      # were never tried at all.
+      if [[ -n "$snmp_resp" ]] && echo "$snmp_resp" | grep -q "a2 " \
+         && echo "$snmp_resp" | grep -qE '(^| )06 [0-9a-f]{2}'; then
         finding "PROTO SNMP: Community '${community}' works on ${snmp_ip} — info disclosure"
-        echo "${snmp_ip} community:${community} — ${snmp_resp:0:80}" \
+        echo "${snmp_ip} community:${community} — ${snmp_resp:0:100}" \
           >> "${dp_dir}/snmp/found.txt"
         break
+      elif [[ -n "$snmp_resp" ]]; then
+        echo "${snmp_ip} community:${community} rejected (response ${snmp_resp:0:40})" \
+          >> "${dp_dir}/snmp/rejected.txt"
       fi
     done
   done
@@ -4819,7 +5942,7 @@ module_deepproto() {
           "exec 3<>/dev/tcp/${scan_ip}/${mqtt_port}
            # MQTT CONNECT: fixed header + variable header + client ID
            printf '\x10\x12\x00\x04MQTT\x04\x00\x00\x3c\x00\x06recon' >&3
-           sleep 1; cat <&3" 2>/dev/null | xxd | head -2 || echo "")
+           sleep 1; cat <&3" 2>/dev/null | hexdump | head -2 || true)
         # CONNACK with return code 0 = open broker
         if echo "$mqtt_resp" | grep -q "20 02 00 00"; then
           finding "PROTO MQTT: Open MQTT broker on ${scan_ip}:${mqtt_port} — unauthenticated"
@@ -4907,10 +6030,25 @@ if ssrf_endpoints:
     for ep in ssrf_endpoints[:10]:
         findings.append(f"  {ep}")
 
-# Webhook paths from auth endpoints
-auth_eps = read(output_dir/"supplemental/wellknown").replace('\x00','')
+# Webhook paths from the well-known documents module 14 actually fetched.
+# The old code passed output_dir/"supplemental/wellknown" -- a DIRECTORY -- to
+# read(). Path.read_text() raises IsADirectoryError, read()'s bare `except` turned
+# that into "", and the webhook check below could never fire. Walk it instead.
+wellknown_dir = output_dir / "supplemental/wellknown"
+auth_eps = ""
+if wellknown_dir.is_dir():
+    for wf in sorted(wellknown_dir.rglob("*")):
+        try:
+            if wf.is_file() and wf.stat().st_size < 2_000_000:
+                auth_eps += read(wf)
+        except OSError:
+            continue
+auth_eps = auth_eps.replace(chr(0), '')
 if "webhook" in auth_eps.lower() or "callback" in auth_eps.lower():
-    findings.append("\nWEBHOOK PATHS FOUND in well-known/auth endpoints — probe for SSRF")
+    hits = sorted({l.strip()[:120] for l in auth_eps.splitlines()
+                   if "webhook" in l.lower() or "callback" in l.lower()})[:10]
+    findings.append("\nWEBHOOK PATHS FOUND in well-known documents — probe for SSRF")
+    findings += [f"  {h}" for h in hits]
 
 # Metadata SSRF test reminder
 findings.append("""
@@ -4940,7 +6078,6 @@ SSRFEOF
     finding "PROTO SSRF: Surface map at ${dp_dir}/ssrf/ssrf_surface.txt"
   fi
 
-  success "Module 22 complete — ${dp_dir}/"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5237,43 +6374,126 @@ PBEOF
     done
   fi
 
-  success "Module 23 complete — ${pb_dir}/playbook.md"
 }
 
 # MAIN EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
+# Module name -> the files it reads. The resume key is built from these, so a
+# module is skipped only when its inputs are byte-identical to the last run.
+declare -A MODULE_INPUTS=(
+  [discover]="${OUTPUT_DIR}/ct/ct_all_domains.txt ${OUTPUT_DIR}/dns/rdns_subdomains.txt ${OUTPUT_DIR}/wayback/wayback_subdomains.txt"
+  [asn]=""
+  [rdns]="${OUTPUT_DIR}/asn/ipv4_cidrs.txt ${OUTPUT_DIR}/asn/scope_cidrs.txt"
+  [ct]=""
+  [wayback]=""
+  [cloud]=""
+  [email]=""
+  [favicon]=""
+  [ports]="${OUTPUT_DIR}/asn/domain_ips.txt ${OUTPUT_DIR}/ct/ct_all_domains.txt"
+  [vhost]="${OUTPUT_DIR}/asn/domain_ips.txt ${OUTPUT_DIR}/ct/ct_all_domains.txt"
+  [params]="${OUTPUT_DIR}/wayback/unique_params.txt"
+  [js]="${HOSTS_FILE} ${OUTPUT_DIR}/ct/ct_all_domains.txt"
+  [correlation]="${OUTPUT_DIR}/ct/ct_all_domains.txt ${OUTPUT_DIR}/dns/rdns_subdomains.txt ${OUTPUT_DIR}/wayback/wayback_subdomains.txt"
+  [supplemental]="${HOSTS_FILE} ${OUTPUT_DIR}/js/all_js_urls.txt ${OUTPUT_DIR}/ct/ct_all_domains.txt"
+  [protocol]="${HOSTS_FILE}"
+  [intelligence]="${HOSTS_FILE} ${OUTPUT_DIR}/correlation/takeover_candidates.txt"
+  [auth]="${HOSTS_FILE}"
+  [cve]="${OUTPUT_DIR}/js/bundles ${OUTPUT_DIR}/supplemental/headers/header_audit.txt"
+  [osint]="${OUTPUT_DIR}/correlation/acquisition_candidates.txt"
+  [content]="${HOSTS_FILE} ${OUTPUT_DIR}/js/extracted_endpoints.txt"
+  [metadata]="${OUTPUT_DIR}/wayback/wayback_raw.txt ${HOSTS_FILE}"
+  [deepproto]="${HOSTS_FILE} ${OUTPUT_DIR}/ports"
+  [playbook]="${OUTPUT_DIR}/intelligence/priority/priority_report.txt ${OUTPUT_DIR}/cve/tech/stack.json"
+)
+
+# Order matters only for readability now that the dependency graph is enforced,
+# but keep the historical order so existing muscle memory still works.
+ALL_MODULES="discover asn rdns ct wayback cloud email favicon ports vhost params js
+             correlation supplemental protocol intelligence auth cve osint content
+             metadata deepproto playbook monitor"
+
+write_manifest() {
+  local plan_ver="3" creds=()
+  [[ -n "$HUNTER_API_KEY"  ]] && creds+=("hunter=yes")
+  [[ -n "$HIBP_API_KEY"    ]] && creds+=("hibp=yes")
+  [[ -n "$VT_API_KEY"      ]] && creds+=("virustotal=yes")
+  [[ -n "$GITHUB_TOKEN"    ]] && creds+=("github=yes")
+  [[ -n "$NVD_API_KEY"     ]] && creds+=("nvd=yes")
+  [[ -n "$URLSCAN_API_KEY" ]] && creds+=("urlscan=yes")
+  {
+    echo "{"
+    echo "  \"target\": \"${DOMAIN}\","
+    echo "  \"output\": \"${OUTPUT_DIR}\","
+    echo "  \"started\": \"$(date '+%Y-%m-%d %H:%M:%S')\","
+    echo "  \"resolved_modules\": \"${MODULES}\","
+    echo "  \"requested_modules\": \"${REQUESTED_MODULES}\","
+    echo "  \"added_by_dependencies\": \"${ADDED_MODULES:-none}\","
+    echo "  \"tier\": \"$([[ "$PASSIVE_ONLY" == true ]] && echo passive || echo full)\","
+    echo "  \"authorized\": ${AUTHORIZED},"
+    echo "  \"authz_ref\": \"${AUTHZ_REF}\","
+    echo "  \"scope_file\": \"${SCOPE_CIDRS_FILE:-none}\","
+    echo "  \"scope_authoritative\": $([[ -n "$SCOPE_CIDRS_FILE" ]] && echo true || echo false),"
+    echo "  \"request_budget\": ${REQUEST_BUDGET},"
+    echo "  \"resume\": ${RESUME},"
+    echo "  \"cache_ttl_seconds\": ${CACHE_TTL},"
+    echo "  \"credentials\": \"${creds[*]:-none}\","
+    echo "  \"script_version\": \"${plan_ver}\""
+    echo "}"
+  } > "${STATE_DIR}/run_manifest.json"
+  verbose "Manifest: ${STATE_DIR}/run_manifest.json"
+}
+
 main() {
   banner
+  # A dry run sends nothing, so it must not require the resolvers it will not
+  # use -- otherwise `--dry-run` is unusable on a machine you are about to
+  # install into.
+  if [[ "$DRY_RUN" == true ]]; then
+    apply_scope
+    REQUESTED_MODULES="$MODULES"
+    resolve_modules
+    warn "DRY RUN — no requests will be sent"
+    local d
+    for d in $MODULES; do echo "  would run: $d"; done
+    echo "  scope:    ${SCOPE_CIDRS_FILE:-none (no -s given; ASN-derived ranges may be used)}"
+    echo "  tier:     $([[ "$PASSIVE_ONLY" == true ]] && echo passive || echo full)"
+    echo "  authz:    ${AUTHZ_REF:-none}"
+    echo "  budget:   ${REQUEST_BUDGET:-unlimited}"
+    return 0
+  fi
   check_core_deps
+  apply_scope
+
+  # -w is a real flag now: an extra content-discovery wordlist, merged in
+  # module 20. It used to be parsed and then never read by anything.
+  [[ -n "$WORDLIST" && ! -f "$WORDLIST" ]] && \
+    warn "Wordlist not found: $WORDLIST (module 20 will not merge it)"
+
+  # Capture what the user asked for before dependency resolution rewrites it.
+  REQUESTED_MODULES="$MODULES"
+  resolve_modules
 
   log "Starting deep_recon.sh for target: $DOMAIN"
   log "Modules: $MODULES"
   log "Output:  $OUTPUT_DIR"
+  write_manifest
 
-  # Run enabled modules
-  module_enabled "asn"         && module_asn
-  module_enabled "rdns"        && module_rdns
-  module_enabled "ct"          && module_ct
-  module_enabled "wayback"     && module_wayback
-  module_enabled "cloud"       && module_cloud
-  module_enabled "email"       && module_email
-  module_enabled "favicon"     && module_favicon
-  module_enabled "ports"       && module_ports
-  module_enabled "vhost"       && module_vhost
-  module_enabled "params"      && module_params
-  module_enabled "js"          && module_js
-  module_enabled "correlation" && module_correlation
-  module_enabled "supplemental"  && module_supplemental
-  module_enabled "protocol"      && module_protocol
-  module_enabled "intelligence"  && module_intelligence
-  module_enabled "auth"          && module_auth
-  module_enabled "cve"           && module_cve
-  module_enabled "osint"         && module_osint
-  module_enabled "content"       && module_content
-  module_enabled "metadata"      && module_metadata
-  module_enabled "deepproto"     && module_deepproto
-  module_enabled "playbook"      && module_playbook
-  module_enabled "monitor"       && module_monitor
+  # Run enabled modules. run_module() guarantees a status record even when a
+  # module returns early on a missing tool or absent input.
+  local m
+  for m in $ALL_MODULES; do
+    module_enabled "$m" || continue
+    if resume_satisfied "$m" "$(resume_key "$m" ${MODULE_INPUTS[$m]:-})"; then
+      info "── ${m}: unchanged since last run, skipping (--resume)"
+      MODULE_CLOSED=false
+      module_start "$m"
+      module_note "SKIPPED_RESUME (inputs unchanged)"
+      module_done SKIPPED "inputs unchanged since last run (--resume)"
+      continue
+    fi
+    run_module "module_${m}"
+    resume_mark "$m" "$(resume_key "$m" ${MODULE_INPUTS[$m]:-})"
+  done
 
   run_integrations
   generate_report

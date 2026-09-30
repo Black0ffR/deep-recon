@@ -15,10 +15,11 @@ Most recon stops at `subfinder + httpx`. The findings live in the layers people 
 
 `deep_recon.sh` automates all of that into one `./recon_<target>_<date>/` directory with a Markdown report.
 
-## Modules (23)
+## Modules (24)
 
 | # | Key | What it does |
 |---|-----|--------------|
+| 0 | `discover` | Host inventory: resolves candidates and probes liveness. Runs first; every other module reads its output |
 | 1 | `asn` | ASN + IPv4/IPv6 CIDR enum (BGPView, MX-IP CDN bypass, org search, HackerTarget, Team Cymru, ARIN RDAP, ipinfo) |
 | 2 | `rdns` | Reverse DNS sweep over discovered CIDRs (dnsx, dig fallback), flags dev/staging/admin names |
 | 3 | `ct` | CT deep mining (crt.sh + Certspotter + BufferOver fallback), org-name search, service/env naming analysis |
@@ -34,7 +35,7 @@ Most recon stops at `subfinder + httpx`. The findings live in the layers people 
 | 13 | `monitor` | Continuous monitor: new subs / ports / certs, Termux notifications, cron hook |
 | 14 | `supplemental` | CAA/SOA, robots/sitemap/security.txt, header audit (CORS/CSP/HSTS/cookies/OPTIONS), source maps, alterx permutations, SPF chain walk, URLScan, SaaS/Firebase detection, GitHub dorks, npm/Docker hints |
 | 15 | `protocol` | WAF/CDN fingerprint, JARM, GraphQL introspection, API version enum, WebSocket discovery, SMTP banner, cache + smuggling indicators |
-| 16 | `intelligence` | APK static analysis, passive→active priority scoring, WAF-evasion validation, VirusTotal passive lookup |
+| 16 | `intelligence` | APK static analysis, passive→active priority scoring, WAF-evasion validation (needs `--authz-ref`), VirusTotal passive lookup (needs `VT_API_KEY`) |
 | 17 | `auth` | Login/OAuth/JWT/SAML/session endpoint discovery + rate-limit probes |
 | 18 | `cve` | Tech-stack fingerprint → NVD/OSV mapping, high-severity report |
 | 19 | `osint` | GitHub org/employee mapping, email patterns, breach/paste hints, acquisitions |
@@ -45,7 +46,7 @@ Most recon stops at `subfinder + httpx`. The findings live in the layers people 
 
 ## Requirements
 
-Core (must exist): `curl`, `dig`, `jq`, `python3`, `whois`
+Core (must exist — the run aborts without them): `curl`, `dig`, `jq`, `python3`
 
 Go tools (recommended): `subfinder`, `httpx`, `waybackurls`, `gau`, `dnsx`, `alterx`, `naabu`
 
@@ -66,7 +67,14 @@ go install github.com/ffuf/ffuf/v2@latest
 pip install arjun --break-system-packages
 ```
 
-Every module degrades gracefully — missing tools are skipped with a warning, never a hard failure.
+Optional (`pkg install coreutils termux-tools`): `whois`, `timeout`, `xxd` or `od`,
+`strings`, `comm`, `seq`. Missing optional tools never abort the run — the affected
+module reports `DEGRADED` with a reason instead, and the reason appears in the
+report's coverage table. A run that reports a tool as missing is a run whose
+coverage is smaller than it looks.
+
+Every module degrades gracefully — but it now says so, rather than finishing with
+a green "complete" and an empty output file.
 
 ## Usage
 
@@ -78,17 +86,27 @@ chmod +x deep_recon.sh
 Options:
 
 ```
--d  DOMAIN       Target domain (required)
--o  OUTPUT_DIR   Output directory (default: ./recon_TARGET_DATE)
--w  WORDLIST     Custom subdomain wordlist
--t  THREADS      Threads for ffuf/httpx (default: 50)
--s  SCOPE_FILE   File with in-scope CIDR ranges (optional)
--m  MODULES      Comma-separated modules (default: all)
---skip-ports     Skip port scanning (faster, less noise)
---passive-only   Zero-noise passive modules only
---resume         Resume previous run
--v               Verbose output
--h, --help       Show help
+-d  DOMAIN         Target domain (required)
+-o  OUTPUT_DIR     Output directory (default: ./recon_TARGET_DATE)
+-w  WORDLIST       Extra content-discovery wordlist, merged in module 20
+-t  THREADS        Threads for ffuf/httpx (default: 50)
+-s  SCOPE_FILE     In-scope CIDRs. AUTHORITATIVE: when given it overrides
+                   ASN-derived ranges everywhere, including the rDNS sweep
+-m  MODULES        Comma-separated modules (default: all). Missing
+                   dependencies are resolved in automatically
+-c  CONFIG         Config file (KEY=VALUE; env still wins)
+--skip-ports       Skip port scanning (faster, less noise)
+--passive-only     Zero-noise tier only — no login attempts, no evasion payloads
+--resume           Skip modules whose inputs are unchanged since the last run
+--authz-ref REF    Authorization reference. REQUIRED for module `auth`
+                   (live credential attempts) and unlocks the WAF-evasion
+                   probes in `intelligence`
+--budget N         Stop after N outbound requests
+--no-cache         Do not read or write the HTTP fetch cache
+--refresh          Ignore the cache TTL and refetch everything
+--dry-run          Plan only: resolve modules and scope, send no requests
+-v                 Verbose output
+-h, --help         Show help
 ```
 
 Examples:
@@ -112,6 +130,15 @@ LOOP=true ./deep_recon.sh -d target.com -m monitor
 MONITOR_CRON=true ./deep_recon.sh -d target.com -m monitor
 ```
 
+# Plan a run without sending a single request
+./deep_recon.sh -d target.com --dry-run
+
+# Cap outbound traffic
+./deep_recon.sh -d target.com --budget 500
+
+# Active testing: modules that attempt logins / send evasion payloads
+./deep_recon.sh -d target.com --authz-ref 'PROGRAM-TICKET-123'
+
 Full integration run (VanguardScanner / nuclei-go / OMEGA hooks):
 
 ```bash
@@ -122,6 +149,8 @@ RUN_INTEGRATIONS=true ./deep_recon.sh -d target.com
 
 ```
 recon_target.com_20240101_1200/
+├── discover/      Host inventory (candidates, resolved, liveness)
+├── state/         run_manifest.json, per-module status, tool-call log, cache
 ├── asn/           ASN, CIDR blocks, IP list
 ├── dns/           Reverse DNS results
 ├── ct/            Certificate transparency mining
@@ -143,11 +172,14 @@ recon_target.com_20240101_1200/
 ├── metadata/      Document URLs + EXIF/author leaks
 ├── deepproto/     Smuggling, SOAP, LDAP/SNMP, MQTT, SSRF map
 ├── playbook/      playbook.md — what to test next
-└── reports/       RECON_REPORT_<target>_<date>.md + favicon hash
+└── reports/       RECON_REPORT_<target>_<date>.md + coverage.json + favicon hash
 ```
 
 Key files to check first after a run:
 
+0. `reports/RECON_REPORT_*.md` — read the **Coverage** table first. A module
+   marked `DEGRADED` or `SKIPPED` is not the same as one that found nothing;
+   every zero in the sections below is only meaningful next to it
 1. `reports/RECON_REPORT_*.md` — executive summary
 2. `correlation/takeover_candidates.txt` — verify immediately
 3. `wayback/sensitive_files.txt` — backups/configs/dumps
@@ -155,6 +187,7 @@ Key files to check first after a run:
 5. `js/omega_run_command.sh` — full OMEGA JS analysis
 6. `ct/ct_analysis.txt` — forgotten infra / acquisitions
 7. `playbook/playbook.md` — your testing checklist
+8. `state/run_manifest.json` — what was requested, what ran, tier, authz, scope
 
 ## Toolchain hooks
 
@@ -173,4 +206,12 @@ Set `RUN_INTEGRATIONS=true` to generate these automatically.
 
 ## Legal
 
-Only run against targets you are authorized to test (your bug bounty scope, your own assets, or explicit permission). Active modules (ports, vhost, content, protocol) send traffic to the target — use `--passive-only` when in doubt, and always respect the program's rules of engagement.
+Only run against targets you are authorized to test (your bug bounty scope, your
+own assets, or explicit permission). Active modules (ports, vhost, content,
+protocol) send traffic to the target — use `--passive-only` when in doubt, and
+always respect the program's rules of engagement.
+
+`auth` and `intelligence` are gated: they attempt real logins and send WAF-evasion
+payloads, and the script refuses to start them without `--authz-ref`. That flag is
+a deliberate act, not a formality — reach for it only when the program actually
+authorizes it. `--passive-only` excludes both.
