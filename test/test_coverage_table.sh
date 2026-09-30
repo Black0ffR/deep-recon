@@ -1,11 +1,18 @@
 #!/bin/bash
 # Render coverage_table() against a fixture state dir and check the markdown.
+# Usage: test_coverage_table.sh [path-to-deep_recon.sh]
+# Portable: resolves the script under test relative to this file (not a
+# hardcoded checkout path) and honours $TMPDIR (/tmp is absent on Termux).
 set -uo pipefail
-MODULE_STATUS_DIR=/tmp/_cov/modules
-rm -rf /tmp/_cov; mkdir -p "$MODULE_STATUS_DIR"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC="${1:-${HERE}/../deep_recon.sh}"
+TMPBASE="${TMPDIR:-${TMP:-/tmp}}"
+MODULE_STATUS_DIR=${TMPBASE}/_cov_$$/modules
+rm -rf "${TMPBASE}/_cov_$$"; mkdir -p "$MODULE_STATUS_DIR"
+trap 'rm -rf "${TMPBASE}/_cov_$$"' EXIT
 printf '%s\n' '{"module":"discover","state":"DEGRADED","seconds":3,"tool_errors":1,"reason":"dnsx missing | only apex | x"}' > "$MODULE_STATUS_DIR/a.json"
 printf '%s\n' '{"module":"asn","state":"RAN","seconds":7,"tool_errors":0,"reason":""}'                                    > "$MODULE_STATUS_DIR/b.json"
-eval "$(sed -n '/^coverage_table() {/,/^}$/p' /workspace/deep-recon-fixed/deep_recon.sh)"
+eval "$(sed -n '/^coverage_table() {/,/^}$/p' "$SRC")"
 out=$(coverage_table)
 printf '%s\n' "$out"
 echo "---"

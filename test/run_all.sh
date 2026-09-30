@@ -21,7 +21,7 @@ run "inline Python payloads compile"  python3 test/check_heredocs.py "$S"
 run "SNMP GetRequest packets"           python3 test/test_snmp_packet.py "$S"
 run "JARM parser + hash"                python3 test/test_jarm.py "$S"
 run "OOXML/PDF metadata extraction"     python3 test/test_metadata.py "$S"
-run "coverage table rendering"          bash test/test_coverage_table.sh
+run "coverage table rendering"          bash test/test_coverage_table.sh "$S"
 run "static invariants"                 python3 test/test_invariants.py "$S"
 
 hr "CLI surface"

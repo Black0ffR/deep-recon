@@ -8,9 +8,12 @@ correct only for a SIX-byte community -- i.e. exactly "public", the first string
 tried. The other eight iterations declared a message length short by
 (len-6) bytes, so a device requiring "private" could never be found.
 """
+import atexit
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SRC = Path(sys.argv[1] if len(sys.argv) > 1 else "deep_recon.sh")
@@ -20,7 +23,13 @@ m = re.search(r"^  snmp_get_request\(\) \{$.*?^  \}$", text, re.S | re.M)
 if not m:
     print("FAIL: snmp_get_request() not found in", SRC)
     sys.exit(1)
-Path("/tmp/_snmp_fn.sh").write_text(m.group(0).replace("\n  ", "\n") + "\n")
+# Portable temp file: /tmp does not exist on all systems (e.g. Termux),
+# so honour $TMPDIR via tempfile instead of a hardcoded /tmp path.
+_fn = tempfile.NamedTemporaryFile("w", suffix="_snmp_fn.sh", delete=False)
+_fn.write(m.group(0).replace("\n  ", "\n") + "\n")
+_fn.close()
+atexit.register(lambda: os.path.exists(_fn.name) and os.unlink(_fn.name))
+FN = _fn.name
 
 
 def reference(comm: str) -> str:
@@ -41,7 +50,7 @@ failures = 0
 for comm in COMMUNITIES:
     out = subprocess.run(
         ["bash", "-c",
-         f'source /tmp/_snmp_fn.sh; snmp_get_request {comm!r} | od -An -tx1 | tr -d " \\n"'],
+         f'source {FN}; snmp_get_request {comm!r} | od -An -tx1 | tr -d " \\n"'],
         capture_output=True, text=True)
     got, exp = out.stdout.strip(), reference(comm)
     ok = got == exp
